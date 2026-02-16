@@ -417,6 +417,12 @@ func main() {
 		}
 	}
 
+	// Password requires username (applies to normal run and config generation).
+	if *password != "" && *username == "" {
+		fmt.Fprintln(os.Stderr, "Error: password requires username. Use -u/--username together with -p/--password.")
+		os.Exit(1)
+	}
+
 	// Generate config and exit without starting the server.
 	if pflag.CommandLine.Changed("gen-config") {
 		target := *generateConfigPath
@@ -541,40 +547,33 @@ func main() {
 		}
 	}
 
-	// Parse shares
-	var shares []Share
+	// Parse shares.
+	// Merge default-config shares with CLI shares. CLI shares override same-name entries.
 	args := pflag.Args()
+	shareMap := map[string]Share{}
 
-	if len(*shareSpecs) == 0 && len(args) == 0 {
-		// No -n flags and no positional arg: use config shares or current dir
-		if config != nil && len(config.Shares) > 0 {
-			for name, path := range config.Shares {
-				absPath, err := filepath.Abs(path)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error resolving path for '%s': %v\n", name, err)
-					os.Exit(1)
-				}
-				shares = append(shares, Share{Name: name, Path: absPath})
-			}
-		} else {
-			// Default: share current directory using folder name
-			absPath, err := filepath.Abs(".")
+	// Base shares from config.
+	if config != nil && len(config.Shares) > 0 {
+		for name, path := range config.Shares {
+			absPath, err := filepath.Abs(path)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error resolving path for '%s': %v\n", name, err)
 				os.Exit(1)
 			}
-			shares = append(shares, Share{Name: shareName(absPath), Path: absPath})
+			shareMap[name] = Share{Name: name, Path: absPath}
 		}
-	} else if len(*shareSpecs) == 0 {
-		// No -n flags but have positional arg: use folder name
+	}
+
+	// CLI shares are additive and override by name.
+	if len(*shareSpecs) == 0 && len(args) > 0 {
 		absPath, err := filepath.Abs(args[0])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
 			os.Exit(1)
 		}
-		shares = append(shares, Share{Name: shareName(absPath), Path: absPath})
-	} else {
-		// Parse each -n flag
+		name := shareName(absPath)
+		shareMap[name] = Share{Name: name, Path: absPath}
+	} else if len(*shareSpecs) > 0 {
 		for _, spec := range *shareSpecs {
 			var name, path string
 			if strings.Contains(spec, ":") {
@@ -582,7 +581,6 @@ func main() {
 				name = parts[0]
 				path = parts[1]
 			} else {
-				// Just a name, use positional arg or current dir
 				name = spec
 				if len(args) > 0 {
 					path = args[0]
@@ -595,8 +593,29 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error resolving path for '%s': %v\n", name, err)
 				os.Exit(1)
 			}
-			shares = append(shares, Share{Name: name, Path: absPath})
+			shareMap[name] = Share{Name: name, Path: absPath}
 		}
+	}
+
+	// Fallback default when neither config nor CLI provided shares.
+	if len(shareMap) == 0 {
+		absPath, err := filepath.Abs(".")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
+			os.Exit(1)
+		}
+		name := shareName(absPath)
+		shareMap[name] = Share{Name: name, Path: absPath}
+	}
+
+	var shares []Share
+	shareNames := make([]string, 0, len(shareMap))
+	for name := range shareMap {
+		shareNames = append(shareNames, name)
+	}
+	sort.Strings(shareNames)
+	for _, name := range shareNames {
+		shares = append(shares, shareMap[name])
 	}
 
 	// Verify all share directories exist
@@ -1214,11 +1233,18 @@ func writeGeneratedConfig(target, listen string, readOnly bool, verbose int, hid
 
 func buildSharesForConfig(shareSpecs []string, args []string) map[string]string {
 	shares := map[string]string{}
+	absOrOriginal := func(path string) string {
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return path
+		}
+		return absPath
+	}
 	if len(shareSpecs) == 0 {
 		if len(args) == 0 {
 			return shares
 		}
-		path := args[0]
+		path := absOrOriginal(args[0])
 		shares[shareName(path)] = path
 		return shares
 	}
@@ -1237,6 +1263,7 @@ func buildSharesForConfig(shareSpecs []string, args []string) map[string]string 
 				path = "."
 			}
 		}
+		path = absOrOriginal(path)
 		shares[name] = path
 	}
 	return shares
