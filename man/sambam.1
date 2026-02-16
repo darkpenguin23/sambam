@@ -20,6 +20,10 @@ Configuration is loaded in this order, with later layers overriding keys set ear
 .I ~/.sambamrc
 .IP "3." 4
 .I ./.sambamrc
+.IP "4." 4
+Each
+.B -c, --config
+file in the order passed
 .PP
 Command-line flags override all config file values.
 .SH OPTIONS
@@ -33,22 +37,19 @@ Listen address (default: 0.0.0.0:445).
 .BR "-r, --readonly"
 Make share read-only.
 .TP
-.BR "--username" " <name>"
+.BR "-u, --username" " <name>"
 Require authentication with this username.
 .TP
-.BR "--password" " <password>"
+.BR "-p, --password" " <password>"
 Authentication password (random if omitted with --username).
 .TP
-.BR "--expire" " <duration>"
+.BR "-e, --expire" " <duration>"
 Auto-shutdown after duration (for example: 30m, 1h, 2h30m).
 .TP
 .BR "-v, --verbose"
 Show activity logs. Use -vv for extended logs and -vvv for full trace.
 .TP
-.BR "--trace"
-Enable full protocol trace (equivalent to -vvv).
-.TP
-.BR "--hide-dotfiles"
+.BR "-H, --hide-dotfiles"
 Hide files starting with '.' from listings.
 .TP
 .BR "-d, --daemon"
@@ -56,11 +57,22 @@ Run in background. Stop with
 .B sambam stop
 .
 .TP
-.BR "-p, --pidfile" " <path>"
+.BR "-P, --pidfile" " <path>"
 PID file path (default: /tmp/sambam.pid).
 .TP
-.BR "-L, --logfile" " <path>"
-Log file path.
+.BR "-L, --logfile" " [path]"
+Log file path. Defaults to
+.I /tmp/sambam.log
+when value is omitted.
+.TP
+.BR "-c, --config" " <path>"
+Load an additional config file. Repeatable. Applied after default config layers.
+.TP
+.BR "-G, --gen-config" " [path]"
+Generate TOML config from current CLI flags and exit without starting the server.
+Default output path is
+.I ./.sambamrc
+when omitted.
 .TP
 .BR "-V, --version"
 Show version and exit.

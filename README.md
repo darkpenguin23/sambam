@@ -39,10 +39,19 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **SMB 2.1 / 3.0 / 3.1.1** - Compatible with modern SMB protocol versions, including POSIX extensions
 - **Single binary** - Runs on any Linux distribution (Debian, Ubuntu, OpenWrt, etc.)
 - **Daemon mode** - Run in background, stop when done
+- **Shell completions** - Bash and Fish completion scripts included
 
 ## Installation
 
-Download the latest binary from the [Releases](https://github.com/darkpenguin23/sambam/releases) page, then:
+Download artifacts from the [Releases](https://github.com/darkpenguin23/sambam/releases) page.
+
+Native packages are available for:
+- Debian/Ubuntu (`.deb`)
+- Fedora/RHEL/openSUSE (`.rpm`)
+- Arch Linux (`.pkg.tar.zst`)
+- Alpine (`.apk`)
+
+You can install the matching package for your distro, or use the standalone binary:
 
 ```bash
 chmod +x sambam-linux-amd64
@@ -53,34 +62,6 @@ Or build from source:
 
 ```bash
 go build -o sambam .
-```
-
-### Bash completion
-
-Load completion for the current shell:
-
-```bash
-source completions/sambam.bash
-```
-
-Install system-wide (Linux):
-
-```bash
-sudo install -D -m 0644 completions/sambam.bash /etc/bash_completion.d/sambam
-```
-
-### Fish completion
-
-Load completion for the current shell:
-
-```fish
-source completions/sambam.fish
-```
-
-Install for current user:
-
-```bash
-install -D -m 0644 completions/sambam.fish ~/.config/fish/completions/sambam.fish
 ```
 
 ## Quick Start
@@ -119,20 +100,20 @@ sudo sambam -l 0.0.0.0:8445 /data
 
 Share in read-only mode. Clients can browse and copy files but cannot modify, delete, or upload.
 
-### `--username <name>`
+### `-u, --username <name>`
 
-Require authentication. Clients must provide this username to access the share. When set, anonymous access is disabled. If `--password` is not specified, a random password is generated and displayed in the banner.
+Require authentication. Clients must provide this username to access the share. When set, anonymous access is disabled. If `-p, --password` is not specified, a random password is generated and displayed in the banner.
 
 ```bash
 sudo sambam --username admin /data
 sudo sambam --username admin --password secret123 /data
 ```
 
-### `--password <password>`
+### `-p, --password <password>`
 
-Set a specific password for authentication. Only used together with `--username`. If omitted, a random 10-character password is generated.
+Set a specific password for authentication. Only used together with `-u, --username`. If omitted, a random 10-character password is generated.
 
-### `--expire <duration>`
+### `-e, --expire <duration>`
 
 Automatically stop sharing after the given duration. Accepts Go duration format: `30m`, `1h`, `2h30m`, etc.
 
@@ -156,11 +137,7 @@ Use verbosity levels:
   15:04:15 [share] delete temp/old-file.txt
 ```
 
-### `--trace`
-
-Shows full protocol trace output. Equivalent to `-vvv`.
-
-### `--hide-dotfiles`
+### `-H, --hide-dotfiles`
 
 Hide files starting with `.` from directory listings. By default dotfiles are visible.
 
@@ -173,17 +150,40 @@ sudo sambam -d /data
 sudo sambam stop
 ```
 
-### `-p, --pidfile <path>`
+### `-P, --pidfile <path>`
 
 PID file location for daemon mode. Default: `/tmp/sambam.pid`.
 
-### `-L, --logfile <path>`
+### `-L, --logfile [path]`
 
 Log file path. In daemon mode, logs go to this file (otherwise daemon output goes to `/dev/null`). In foreground mode, logs are written to both terminal and this file.
+If used without a value, defaults to `/tmp/sambam.log`.
+
+### `-c, --config <path>`
+
+Load an additional config file. Repeatable.
+
+Custom config files are applied after `/etc/sambamrc`, `~/.sambamrc`, and `./.sambamrc`, in the order they are passed. CLI flags still have highest priority.
+
+```bash
+sambam -c /etc/sambam-prod.toml -c ./sambam.override.toml
+```
 
 ```bash
 sudo sambam -d -L /var/log/sambam.log /data
 sudo sambam -L /tmp/sambam.log /data
+```
+
+### `-G, --gen-config [path]`
+
+Generate a TOML config from the currently passed CLI flags and exit without starting the server.
+
+- If no path is given, writes `./.sambamrc`
+- If a path is given, writes to that file
+
+```bash
+sambam -r -u admin -p secret -G
+sambam -l 10.23.22.13:445 -e 1h -G /tmp/sambamrc.toml
 ```
 
 ### `-V, --version`
@@ -201,6 +201,7 @@ sambam reads configuration in this order:
 1. Base config: `/etc/sambamrc` (if present)
 2. User overrides: `~/.sambamrc` (if present)
 3. Local overrides: `./.sambamrc` (if present)
+4. Extra overrides: each `-c, --config <path>` in the order passed (required to exist)
 
 Local config overrides only the keys explicitly set in `./.sambamrc`.
 For `[shares]`, entries are merged by share name (later layers override same-name entries from earlier layers).
@@ -240,8 +241,6 @@ readonly = false
 verbose = true
 # verbose_level = 2   # equivalent to -vv
 
-# Show full protocol trace (very verbose)
-# trace = true
 # verbose_level = 3   # equivalent to -vvv
 
 # Hide files starting with '.'
@@ -277,7 +276,7 @@ sambam -v
 You will see a line like:
 
 ```text
-config: system=true (/etc/sambamrc), home=true (/root/.sambamrc), local=true (.sambamrc)
+config: system=true (/etc/sambamrc), home=true (/root/.sambamrc), local=true (.sambamrc), custom=0
 ```
 
 ## Connecting from Windows

@@ -13,9 +13,6 @@ verbose = true
 # verbose_level = 2   # equivalent to -vv
 # verbose_level = 3   # equivalent to -vvv
 
-# Show full protocol trace (very verbose)
-# trace = true
-
 # Hide files starting with '.'
 # hide_dotfiles = true
 
