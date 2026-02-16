@@ -1,7 +1,7 @@
 project_name: sambam
 
-# Configuration format version (v1 for older goreleaser)
-version: 1
+# Configuration format version (v2 - required by current GoReleaser)
+version: 2
 
 before:
   hooks:
