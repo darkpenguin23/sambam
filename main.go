@@ -784,7 +784,7 @@ func main() {
 			if listenPort != "445" {
 				portSuffix = ":" + listenPort
 			}
-			printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true)
+			printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true, extraVerbose)
 			printConfigLogs()
 
 			fmt.Println()
@@ -960,7 +960,7 @@ func main() {
 
 	// Print banner in foreground mode.
 	if !*daemonMode {
-		printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false)
+		printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false, extraVerbose)
 		printConfigLogs()
 	}
 
@@ -1078,9 +1078,9 @@ func normalizeLogPath(path string) string {
 	return path
 }
 
-func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, username string, password string, expireStr string, daemonMode bool) {
+func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, username string, password string, expireStr string, daemonMode bool, extendedConnect bool) {
 	fmt.Println()
-	fmt.Printf("  %s\n", CyanBold("sambam v"+version))
+	fmt.Printf("  %s %s\n", CyanBold("sambam v"+version), Dim("(built with AI assistance)"))
 	fmt.Println()
 
 	// Show shares
@@ -1105,7 +1105,12 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 		}
 	}
 
-	fmt.Printf("  %-12s %s\n", "Listen", listenAddr)
+	listenHost, _ := parseHostPort(listenAddr)
+	listenColored := Yellow(listenAddr)
+	if listenHost == "" || listenHost == "0.0.0.0" || listenHost == "::" {
+		listenColored = Dim(listenAddr)
+	}
+	fmt.Printf("  %-12s %s\n", "Listen", listenColored)
 
 	modeStr := "read-write"
 	if readOnly {
@@ -1121,10 +1126,12 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 		fmt.Printf("  %-12s %s\n", "Auth", Dim("anonymous"))
 	}
 	allowText := "all"
+	allowTextColored := Dim("all")
 	if len(allowAddrs) > 0 {
 		allowText = strings.Join(allowAddrs, ", ")
+		allowTextColored = Yellow(allowText)
 	}
-	fmt.Printf("  %-12s %s\n", "Allowlist", allowText)
+	fmt.Printf("  %-12s %s\n", "Allowlist", allowTextColored)
 
 	// Extract port number from portSuffix (":8888" -> "8888")
 	nonStdPort := portSuffix != ""
@@ -1133,38 +1140,19 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 		portNum = portSuffix[1:] // strip leading ":"
 	}
 
+	firstIP := displayIPs[0]
+	firstShare := shares[0].Name
+	comboCount := len(displayIPs) * len(shares)
+
 	fmt.Println()
+	fmt.Println("  Connect:")
 	if nonStdPort {
-		fmt.Println("  Connect from Windows " + Dim("(requires SSH tunnel)") + ":")
-		for _, ip := range displayIPs {
-			fmt.Printf("    %s\n", Cyan(fmt.Sprintf("ssh -L 445:%s:%s user@%s", ip, portNum, ip)))
-		}
-		fmt.Printf("    %s\n", Dim("then connect to:")+" "+Cyan("\\\\localhost\\"+shares[0].Name))
+		fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+firstShare)+" "+Dim("(SSH tunnel)"))
+		fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+firstShare)+" "+Dim("(SSH tunnel)"))
 	} else {
-		fmt.Println("  Connect from Windows:")
-		for _, share := range shares {
-			for _, ip := range displayIPs {
-				fmt.Printf("    %s\n", Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
-			}
-		}
+		fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
+		fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
 	}
-	fmt.Println()
-	if nonStdPort {
-		fmt.Println("  Connect from macOS " + Dim("(requires SSH tunnel)") + ":")
-		for _, ip := range displayIPs {
-			fmt.Printf("    %s\n", Cyan(fmt.Sprintf("ssh -L 445:%s:%s user@%s", ip, portNum, ip)))
-		}
-		fmt.Printf("    %s\n", Dim("then connect to:")+" "+Cyan("smb://localhost/"+shares[0].Name))
-	} else {
-		fmt.Println("  Connect from macOS:")
-		for _, share := range shares {
-			for _, ip := range displayIPs {
-				fmt.Printf("    %s\n", Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
-			}
-		}
-	}
-	fmt.Println()
-	fmt.Println("  Connect from Linux:")
 	authOpt := "guest"
 	if username != "" {
 		authOpt = "username=" + username + ",password=" + password
@@ -1173,18 +1161,45 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	if nonStdPort {
 		portOpt = ",port=" + portNum
 	}
-	for _, share := range shares {
-		for _, ip := range displayIPs {
-			fmt.Printf("    %s\n", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", ip, share.Name, authOpt, portOpt)))
+	fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, authOpt, portOpt)))
+	if comboCount > 1 && !extendedConnect {
+		fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("(%d additional share/ip combinations; use -vv to show all)", comboCount-1)))
+	}
+
+	if extendedConnect {
+		fmt.Printf("  %-12s %s %s\n", "", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s,vers=3.1.1,posix,cifsacl", firstIP, firstShare, authOpt, portOpt)), Dim("# POSIX"))
+
+		if nonStdPort {
+			fmt.Println()
+			fmt.Println("  SSH tunnel:")
+			for _, ip := range displayIPs {
+				fmt.Printf("    %s\n", Cyan(fmt.Sprintf("ssh -L 445:%s:%s user@%s", ip, portNum, ip)))
+			}
+		}
+
+		if comboCount > 1 {
+			fmt.Println()
+			fmt.Println("  All endpoints:")
+			if nonStdPort {
+				for _, share := range shares {
+					fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+share.Name)+" "+Dim("(SSH tunnel)"))
+					fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+share.Name)+" "+Dim("(SSH tunnel)"))
+				}
+			} else {
+				for _, share := range shares {
+					for _, ip := range displayIPs {
+						fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
+						fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
+					}
+				}
+			}
+			for _, share := range shares {
+				for _, ip := range displayIPs {
+					fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", ip, share.Name, authOpt, portOpt)))
+				}
+			}
 		}
 	}
-	for _, share := range shares {
-		for _, ip := range displayIPs {
-			fmt.Printf("    %s %s\n", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s,vers=3.1.1,posix,cifsacl", ip, share.Name, authOpt, portOpt)), Dim("# POSIX"))
-		}
-	}
-	fmt.Println()
-	fmt.Printf("  %s\n", Dim("Built with AI assistance"))
 	fmt.Println()
 	if daemonMode {
 		fmt.Printf("  %s\n", Red("Daemon mode: running in background"))
