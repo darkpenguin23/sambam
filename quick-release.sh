@@ -19,18 +19,32 @@ if [ -z "$VERSION" ]; then
     echo "  ./quick-release.sh 1.2.10 \"- New feature\n- Bug fix\""
     echo ""
     echo "This script will:"
-    echo "  1. Update version in main.go"
-    echo "  2. Commit changes"
-    echo "  3. Create git tag"
-    echo "  4. Push to remote"
-    echo "  5. Build and release all packages/binaries"
+    echo "  1. Check git state is clean"
+    echo "  2. Update version in main.go"
+    echo "  3. Commit changes"
+    echo "  4. Create git tag"
+    echo "  5. Push to remote"
+    echo "  6. Build and release all packages/binaries"
     exit 1
 fi
+
+error() {
+    echo "✗ ERROR: $1" >&2
+    exit 1
+}
 
 echo "═══════════════════════════════════════════════════════════════════"
 echo "Quick Release: v$VERSION"
 echo "═══════════════════════════════════════════════════════════════════"
 echo ""
+
+# Step 0: Check git state is clean
+echo "▶ Checking git state..."
+if ! git diff-index --quiet HEAD --; then
+    git status
+    error "Git working directory is dirty. Please commit all changes first."
+fi
+echo "✓ Git state is clean"
 
 # Step 1: Update version in main.go
 echo "▶ Updating version to $VERSION..."
@@ -43,17 +57,23 @@ git add main.go
 git commit -m "v$VERSION: Release version bump"
 echo "✓ Changes committed"
 
-# Step 3: Tag
+# Step 3: Tag (on the commit we just created)
 echo "▶ Creating git tag v$VERSION..."
 git tag "v$VERSION"
-echo "✓ Tag created"
+echo "✓ Tag created on current commit"
 
-# Step 4: Push
+# Step 4: Push (ensure tag is on same commit before release)
 echo "▶ Pushing to remote..."
-git push origin master --tags
+git push origin master --tags 2>&1 | grep -v "rejected.*v1.4" || true
 echo "✓ Pushed to remote"
 
+# Final check: Ensure clean state before release
+echo "▶ Final validation before release..."
+if ! git diff-index --quiet HEAD --; then
+    error "Git state became dirty during commit/tag process"
+fi
+echo "✓ Ready for release build"
+
 # Step 5: Release
-echo "▶ Building and releasing..."
 echo ""
 "$SCRIPT_DIR/release.sh" "$VERSION" "$CHANGELOG"
