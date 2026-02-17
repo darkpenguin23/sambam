@@ -96,6 +96,20 @@ Address and port to listen on. Default: `0.0.0.0:445`. Use a non-standard port i
 sudo sambam -l 0.0.0.0:8445 /data
 ```
 
+### `-a, --allow <ip-or-cidr>`
+
+Allowlist client source addresses. Repeatable.
+
+Accepted values:
+- Single IP (`192.168.1.10`)
+- CIDR network (`192.168.1.0/24`)
+
+If one or more `--allow` rules are set, only matching clients can connect.
+
+```bash
+sambam -a 192.168.1.10 -a 192.168.2.0/24 /data
+```
+
 ### `-r, --readonly`
 
 Share in read-only mode. Clients can browse and copy files but cannot modify, delete, or upload.
@@ -233,6 +247,9 @@ Example configuration file (TOML):
 ```toml
 # Listen address
 listen = "0.0.0.0:445"
+
+# Allowlist clients (optional)
+# allow = ["192.168.1.10", "192.168.2.0/24"]
 
 # Read-only mode
 readonly = false

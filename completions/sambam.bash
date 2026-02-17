@@ -7,7 +7,7 @@ _sambam_complete()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local global_flags="--name --listen --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
+    local global_flags="--name --listen --allow --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
     local stop_flags="--pidfile --help"
     local cmds="stop"
     local _path_candidates
@@ -44,7 +44,7 @@ _sambam_complete()
             _sambam_complete_path
             return 0
             ;;
-        -l|--listen|-u|--username|-p|--password|-e|--expire)
+        -l|--listen|-a|--allow|-u|--username|-p|--password|-e|--expire)
             return 0
             ;;
         -n|--name)

@@ -61,6 +61,8 @@ type Server struct {
 	acceptSingleConn bool
 
 	onConnect  func(remoteAddr string)
+	onReject   func(remoteAddr string)
+	allowConn  func(remoteAddr string) bool
 	onRename   func(from, to string)
 	onDetect   func(action, path string)
 	onAuthFail func(remoteAddr, username string)
@@ -167,6 +169,8 @@ type ServerConfig struct {
 	IgnoreSetAttrErr bool
 	AcceptSingleConn bool
 	HideDotfiles     bool                              // Hide files starting with '.'
+	AllowConn        func(remoteAddr string) bool      // Return true to allow a client connection
+	OnReject         func(remoteAddr string)           // Called when a client is rejected by allow policy
 	OnConnect        func(remoteAddr string)           // Called when a client connects
 	OnRename         func(from, to string)             // Called on file rename
 	OnDetect         func(action, path string)         // Called on fsnotify event
@@ -192,6 +196,8 @@ func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFile
 		hideDotfiles:     cfg.HideDotfiles,
 		activeConns:      map[*conn]struct{}{},
 		acceptSingleConn: cfg.AcceptSingleConn,
+		allowConn:        cfg.AllowConn,
+		onReject:         cfg.OnReject,
 		onConnect:        cfg.OnConnect,
 		onRename:         cfg.OnRename,
 		onDetect:         cfg.OnDetect,
@@ -239,9 +245,18 @@ func (d *Server) Serve(addr string) error {
 			continue
 		}
 
+		remoteAddr := c.RemoteAddr().String()
+		if d.allowConn != nil && !d.allowConn(remoteAddr) {
+			if d.onReject != nil {
+				d.onReject(remoteAddr)
+			}
+			_ = c.Close()
+			continue
+		}
+
 		// Call connection callback if set
 		if d.onConnect != nil {
-			d.onConnect(c.RemoteAddr().String())
+			d.onConnect(remoteAddr)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -254,7 +269,7 @@ func (d *Server) Serve(addr string) error {
 
 		conn := &conn{
 			t:                   direct(c),
-			remoteAddr:          c.RemoteAddr().String(),
+			remoteAddr:          remoteAddr,
 			sessions:            make(map[uint64]*session),
 			outstandingRequests: newOutstandingRequests(),
 			account:             a,
@@ -1168,8 +1183,8 @@ func (c *conn) sessionSetupNewBinding(pkt []byte) error {
 	}
 
 	c.pendingSetup = &pendingSessionSetup{
-		spnego:    bindSpnego,
-		sessionId: sessionId,
+		spnego:      bindSpnego,
+		sessionId:   sessionId,
 		preauthHash: bindHash,
 	}
 

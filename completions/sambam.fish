@@ -11,6 +11,7 @@ complete -c sambam -n "__fish_use_subcommand" -a stop -d "Stop running daemon"
 # Main-mode flags
 complete -c sambam -n "__fish_sambam_no_subcommand" -s n -l name -r -d "Share name or name:path (repeatable)"
 complete -c sambam -n "__fish_sambam_no_subcommand" -s l -l listen -r -d "Address to listen on"
+complete -c sambam -n "__fish_sambam_no_subcommand" -s a -l allow -r -d "Allow client IP/CIDR (repeatable)"
 complete -c sambam -n "__fish_sambam_no_subcommand" -s r -l readonly -d "Make share read-only"
 complete -c sambam -n "__fish_sambam_no_subcommand" -s d -l daemon -d "Run as background daemon"
 complete -c sambam -n "__fish_sambam_no_subcommand" -s P -l pidfile -r -d "PID file location"

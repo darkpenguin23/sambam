@@ -1,1 +1,4 @@
-readonly = true
+# sambam generated configuration
+# CLI flags override these settings.
+
+allow = ["10.23.0.0/16"]

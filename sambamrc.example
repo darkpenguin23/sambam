@@ -5,6 +5,9 @@
 # Listen address (default: 0.0.0.0:445)
 listen = "0.0.0.0:445"
 
+# Allowlist clients (optional)
+# allow = ["192.168.1.10", "192.168.2.0/24"]
+
 # Read-only mode
 readonly = false
 

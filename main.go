@@ -40,6 +40,7 @@ type Config struct {
 	VerboseLevel int               `toml:"verbose_level"`
 	Debug        bool              `toml:"debug"` // backward compatibility: maps to verbose_level=3
 	Trace        bool              `toml:"trace"`
+	Allow        []string          `toml:"allow"`
 	HideDotfiles bool              `toml:"hide_dotfiles"`
 	Username     string            `toml:"username"`
 	Password     string            `toml:"password"`
@@ -88,6 +89,9 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	}
 	if md.IsDefined("trace") {
 		dst.Trace = src.Trace
+	}
+	if md.IsDefined("allow") {
+		dst.Allow = append([]string(nil), src.Allow...)
 	}
 	if md.IsDefined("hide_dotfiles") {
 		dst.HideDotfiles = src.HideDotfiles
@@ -139,6 +143,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("trace") {
 		record("trace")
 	}
+	if md.IsDefined("allow") {
+		record("allow")
+	}
 	if md.IsDefined("hide_dotfiles") {
 		record("hide_dotfiles")
 	}
@@ -182,6 +189,8 @@ func configValueString(cfg *Config, key string) string {
 		return strconv.FormatBool(cfg.Debug)
 	case "trace":
 		return strconv.FormatBool(cfg.Trace)
+	case "allow":
+		return strings.Join(cfg.Allow, ",")
 	case "hide_dotfiles":
 		return strconv.FormatBool(cfg.HideDotfiles)
 	case "username":
@@ -344,6 +353,7 @@ func main() {
 	// CLI flags
 	shareSpecs := pflag.StringArrayP("name", "n", []string{}, "Share specification (name:path or just name)")
 	listenAddr := pflag.StringP("listen", "l", "0.0.0.0:445", "Address to listen on")
+	allowAddrs := pflag.StringArrayP("allow", "a", []string{}, "Allow client IP/CIDR (repeatable)")
 	readOnly := pflag.BoolP("readonly", "r", false, "Make share read-only")
 	showVersion := pflag.BoolP("version", "V", false, "Show version")
 	showHelp := pflag.BoolP("help", "h", false, "Show help")
@@ -397,6 +407,9 @@ func main() {
 				*verbose = 3
 			}
 		}
+		if !pflag.CommandLine.Changed("allow") && len(config.Allow) > 0 {
+			*allowAddrs = append([]string(nil), config.Allow...)
+		}
 		if !pflag.CommandLine.Changed("username") && config.Username != "" {
 			*username = config.Username
 		}
@@ -422,6 +435,90 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: password requires username. Use -u/--username together with -p/--password.")
 		os.Exit(1)
 	}
+	allowNets, err := parseAllowedNetworks(*allowAddrs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid allow rule: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Build effective settings view for debug logging (after config + CLI precedence).
+	effectiveConfig := Config{}
+	if config != nil {
+		effectiveConfig = *config
+		if config.Allow != nil {
+			effectiveConfig.Allow = append([]string(nil), config.Allow...)
+		}
+		if config.Shares != nil {
+			effectiveConfig.Shares = make(map[string]string, len(config.Shares))
+			for k, v := range config.Shares {
+				effectiveConfig.Shares[k] = v
+			}
+		}
+	}
+	effectiveConfig.Listen = *listenAddr
+	effectiveConfig.Readonly = *readOnly
+	effectiveConfig.HideDotfiles = *hideDotfiles
+	effectiveConfig.Username = *username
+	effectiveConfig.Password = *password
+	effectiveConfig.Expire = *expireStr
+	effectiveConfig.PidFile = *pidFile
+	effectiveConfig.LogFile = *logFile
+	effectiveConfig.Allow = append([]string(nil), *allowAddrs...)
+	if *verbose <= 0 {
+		effectiveConfig.Verbose = false
+		effectiveConfig.VerboseLevel = 0
+	} else if *verbose == 1 {
+		effectiveConfig.Verbose = true
+		effectiveConfig.VerboseLevel = 0
+	} else {
+		effectiveConfig.Verbose = false
+		effectiveConfig.VerboseLevel = *verbose
+	}
+	effectiveSrc := map[string]string{}
+	for k, v := range configInfo.SettingSrc {
+		effectiveSrc[k] = v
+	}
+	markCLI := func(key string) { effectiveSrc[key] = "cli" }
+	if pflag.CommandLine.Changed("listen") {
+		markCLI("listen")
+	}
+	if pflag.CommandLine.Changed("readonly") {
+		markCLI("readonly")
+	}
+	if pflag.CommandLine.Changed("verbose") {
+		if *verbose <= 1 {
+			markCLI("verbose")
+			if _, ok := configInfo.SettingSrc["verbose_level"]; ok {
+				markCLI("verbose_level")
+			}
+		} else {
+			markCLI("verbose_level")
+			if _, ok := configInfo.SettingSrc["verbose"]; ok {
+				markCLI("verbose")
+			}
+		}
+	}
+	if pflag.CommandLine.Changed("allow") {
+		markCLI("allow")
+	}
+	if pflag.CommandLine.Changed("hide-dotfiles") {
+		markCLI("hide_dotfiles")
+	}
+	if pflag.CommandLine.Changed("username") {
+		markCLI("username")
+	}
+	if pflag.CommandLine.Changed("password") {
+		markCLI("password")
+	}
+	if pflag.CommandLine.Changed("expire") {
+		markCLI("expire")
+	}
+	if pflag.CommandLine.Changed("pidfile") {
+		markCLI("pidfile")
+	}
+	if pflag.CommandLine.Changed("logfile") {
+		markCLI("logfile")
+	}
 
 	// Generate config and exit without starting the server.
 	if pflag.CommandLine.Changed("gen-config") {
@@ -429,7 +526,7 @@ func main() {
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddr, *readOnly, *verbose, *hideDotfiles, *username, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		written, err := writeGeneratedConfig(target, *listenAddr, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *username, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
@@ -535,14 +632,18 @@ func main() {
 				configInfo.SystemPath, configInfo.HomePath, configInfo.LocalPath, len(configInfo.CustomPaths),
 			)
 		}
-		if *verbose >= 2 && len(configInfo.SettingSrc) > 0 {
-			keys := make([]string, 0, len(configInfo.SettingSrc))
-			for k := range configInfo.SettingSrc {
+		if *verbose >= 2 && len(effectiveSrc) > 0 {
+			keys := make([]string, 0, len(effectiveSrc))
+			for k := range effectiveSrc {
 				keys = append(keys, k)
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				logrus.Debugf("config setting: %s=%q <- %s", k, configValueString(config, k), configInfo.SettingSrc[k])
+				msg := fmt.Sprintf("config setting: %s=%q <- %s", k, configValueString(&effectiveConfig, k), effectiveSrc[k])
+				if baseSrc, ok := configInfo.SettingSrc[k]; ok && effectiveSrc[k] == "cli" && baseSrc != "cli" {
+					msg += fmt.Sprintf(" (%s overridden by cli)", baseSrc)
+				}
+				logrus.Debug(msg)
 			}
 		}
 	}
@@ -683,7 +784,7 @@ func main() {
 			if listenPort != "445" {
 				portSuffix = ":" + listenPort
 			}
-			printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *username, actualPassword, *expireStr, true)
+			printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true)
 			printConfigLogs()
 
 			fmt.Println()
@@ -813,10 +914,16 @@ func main() {
 			AllowGuest:   allowGuest,
 			Xatrrs:       true,
 			HideDotfiles: *hideDotfiles,
-			OnConnect:    onConnect,
-			OnRename:     onRename,
-			OnDetect:     onDetect,
-			OnAuthFail:   onAuthFail,
+			AllowConn: func(remoteAddr string) bool {
+				return isRemoteAllowed(remoteAddr, allowNets)
+			},
+			OnReject: func(remoteAddr string) {
+				logrus.Warnf("reject: %s (not in allow list)", remoteAddr)
+			},
+			OnConnect:  onConnect,
+			OnRename:   onRename,
+			OnDetect:   onDetect,
+			OnAuthFail: onAuthFail,
 		},
 		&smb2.NTLMAuthenticator{
 			TargetSPN:    "",
@@ -853,7 +960,7 @@ func main() {
 
 	// Print banner in foreground mode.
 	if !*daemonMode {
-		printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *username, actualPassword, *expireStr, false)
+		printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false)
 		printConfigLogs()
 	}
 
@@ -971,7 +1078,7 @@ func normalizeLogPath(path string) string {
 	return path
 }
 
-func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []string, portSuffix string, username string, password string, expireStr string, daemonMode bool) {
+func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, username string, password string, expireStr string, daemonMode bool) {
 	fmt.Println()
 	fmt.Printf("  %s\n", CyanBold("sambam v"+version))
 	fmt.Println()
@@ -1013,6 +1120,11 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	} else {
 		fmt.Printf("  %-12s %s\n", "Auth", Dim("anonymous"))
 	}
+	allowText := "all"
+	if len(allowAddrs) > 0 {
+		allowText = strings.Join(allowAddrs, ", ")
+	}
+	fmt.Printf("  %-12s %s\n", "Allowlist", allowText)
 
 	// Extract port number from portSuffix (":8888" -> "8888")
 	nonStdPort := portSuffix != ""
@@ -1108,6 +1220,7 @@ func printUsage() {
 
 	printOpt("-n, --name", "Share name or name:path "+Dim("(repeatable)"))
 	printOpt("-l, --listen", "Address to listen on "+Dim("(default: 0.0.0.0:445)"))
+	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
 	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-u, --username", "Require authentication")
 	printOpt("-p, --password", "Password "+Dim("(random if not set)"))
@@ -1160,7 +1273,7 @@ func normalizeCLIArgs(args []string) []string {
 	return out
 }
 
-func writeGeneratedConfig(target, listen string, readOnly bool, verbose int, hideDotfiles bool, username, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
+func writeGeneratedConfig(target, listen string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, username, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
 	var b bytes.Buffer
 	written := []string{}
 	b.WriteString("# sambam generated configuration\n")
@@ -1178,9 +1291,20 @@ func writeGeneratedConfig(target, listen string, readOnly bool, verbose int, hid
 		fmt.Fprintf(&b, "%s = %d\n", key, value)
 		written = append(written, fmt.Sprintf("%s=%d", key, value))
 	}
+	writeStringArray := func(key string, values []string) {
+		quoted := make([]string, 0, len(values))
+		for _, v := range values {
+			quoted = append(quoted, strconv.Quote(v))
+		}
+		fmt.Fprintf(&b, "%s = [%s]\n", key, strings.Join(quoted, ", "))
+		written = append(written, fmt.Sprintf("%s=%s", key, strings.Join(values, ",")))
+	}
 
 	if pflag.CommandLine.Changed("listen") {
 		writeString("listen", listen)
+	}
+	if pflag.CommandLine.Changed("allow") {
+		writeStringArray("allow", allowAddrs)
 	}
 	if pflag.CommandLine.Changed("readonly") {
 		writeBool("readonly", readOnly)
@@ -1288,6 +1412,62 @@ func parseHostPort(addr string) (host, port string) {
 		return addr, ""
 	}
 	return host, port
+}
+
+func parseAllowedNetworks(values []string) ([]*net.IPNet, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	nets := make([]*net.IPNet, 0, len(values))
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if strings.Contains(v, "/") {
+			_, n, err := net.ParseCIDR(v)
+			if err != nil {
+				return nil, fmt.Errorf("%q is not a valid CIDR", raw)
+			}
+			nets = append(nets, n)
+			continue
+		}
+
+		ip := net.ParseIP(v)
+		if ip == nil {
+			return nil, fmt.Errorf("%q is not a valid IP or CIDR", raw)
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			nets = append(nets, &net.IPNet{IP: ip4, Mask: net.CIDRMask(32, 32)})
+		} else {
+			nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+		}
+	}
+	return nets, nil
+}
+
+func isRemoteAllowed(remoteAddr string, allowNets []*net.IPNet) bool {
+	if len(allowNets) == 0 {
+		return true
+	}
+
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	}
+	for _, n := range allowNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func getLocalIPs() []string {
