@@ -624,7 +624,7 @@ func (c *conn) treeDisconnect(pkt []byte) error {
 
 	tc, ok := c.treeMapById[p.TreeId()]
 	if !ok {
-		log.Warnf(fmt.Sprintf("tree doesn't exist: %d", p.TreeId()))
+		log.Warnf("tree doesn't exist: %d", p.TreeId())
 	}
 
 	var tree *treeConn = nil
