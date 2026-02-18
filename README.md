@@ -116,6 +116,19 @@ If one or more `--allow` rules are set, only matching clients can connect.
 sambam -a 192.168.1.10 -a 192.168.2.0/24 /data
 ```
 
+### `--advertise` / `--no-advertise`
+
+By default, sambam advertises the SMB service for LAN discovery using:
+- Bonjour/mDNS (`_smb._tcp`)
+- WS-Discovery (Windows Network discovery)
+
+Use `--no-advertise` to disable discovery announcements.
+
+```bash
+sambam /data
+sambam --no-advertise /data
+```
+
 ### `-r, --readonly`
 
 Share in read-only mode. Clients can browse and copy files but cannot modify, delete, or upload.
@@ -207,10 +220,11 @@ Hide files starting with `.` from directory listings. By default dotfiles are vi
 
 ### `-d, --daemon`
 
-Run sambam as a background daemon. Use `sambam stop` to stop it.
+Run sambam as a background daemon. Use `sambam status` to inspect it and `sambam stop` to stop it.
 
 ```bash
 sudo sambam -d /data
+sudo sambam status
 sudo sambam stop
 ```
 
@@ -276,6 +290,7 @@ listen = "0.0.0.0:445"
 # listen_addrs = ["@eth0:445", "10.23.22.13:445"]
 
 allow = ["10.23.0.0/16"]
+advertise = true
 readonly = false
 hide_dotfiles = false
 
@@ -318,6 +333,7 @@ readonly = false
 Global options:
 - `listen` / `listen_addrs`
 - `allow`
+- `advertise` (default: `true`)
 - `hide_dotfiles`
 - `readonly`
 - `expire`

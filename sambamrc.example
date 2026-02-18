@@ -12,6 +12,9 @@ listen = "0.0.0.0:445"
 # Allowlist clients (IP or CIDR)
 allow = ["10.23.0.0/16"]
 
+# Advertise SMB share via mDNS (_smb._tcp) + WS-Discovery
+advertise = true
+
 # Global defaults
 readonly = false
 hide_dotfiles = false

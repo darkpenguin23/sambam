@@ -2,22 +2,30 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/grandcat/zeroconf"
 	"github.com/sevlyar/go-daemon"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
@@ -59,6 +67,7 @@ type UserConfig struct {
 type Config struct {
 	Listen       string       `toml:"listen"`
 	ListenAddrs  []string     `toml:"listen_addrs"`
+	Advertise    bool         `toml:"advertise"`
 	Readonly     bool         `toml:"readonly"`
 	Verbose      bool         `toml:"verbose"`
 	VerboseLevel int          `toml:"verbose_level"`
@@ -86,10 +95,58 @@ type ConfigLoadInfo struct {
 	SettingSrc   map[string]string
 }
 
+type daemonStatus struct {
+	PID        int      `json:"pid"`
+	PIDFile    string   `json:"pid_file"`
+	LogFile    string   `json:"log_file"`
+	Shares     []Share  `json:"shares"`
+	Listen     string   `json:"listen"`
+	Auth       string   `json:"auth"`
+	AllowAddrs []string `json:"allow_addrs"`
+	UpdatedAt  string   `json:"updated_at"`
+}
+
+type discoveryAdvertiser struct {
+	mdns *zeroconf.Server
+	wsd  *wsDiscoveryService
+}
+
+func (d *discoveryAdvertiser) Shutdown() {
+	if d == nil {
+		return
+	}
+	if d.mdns != nil {
+		d.mdns.Shutdown()
+	}
+	if d.wsd != nil {
+		d.wsd.Shutdown()
+	}
+}
+
+type wsDiscoveryService struct {
+	conn            *net.UDPConn
+	httpServer      *http.Server
+	multicastAddr   *net.UDPAddr
+	endpointAddress string
+	endpointUUID    string
+	xaddr           string
+	xaddrs          []string
+	friendlyName    string
+	manufacturer    string
+	workgroup       string
+	scopes          string
+	metadataVersion int
+	sequenceID      string
+	messageNumber   uint64
+	stop            chan struct{}
+	wg              sync.WaitGroup
+}
+
 func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	type rawConfig struct {
 		Listen       string                    `toml:"listen"`
 		ListenAddrs  []string                  `toml:"listen_addrs"`
+		Advertise    bool                      `toml:"advertise"`
 		Readonly     bool                      `toml:"readonly"`
 		Verbose      bool                      `toml:"verbose"`
 		VerboseLevel int                       `toml:"verbose_level"`
@@ -115,6 +172,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	cfg := &Config{
 		Listen:       raw.Listen,
 		ListenAddrs:  append([]string(nil), raw.ListenAddrs...),
+		Advertise:    raw.Advertise,
 		Readonly:     raw.Readonly,
 		Verbose:      raw.Verbose,
 		VerboseLevel: raw.VerboseLevel,
@@ -176,6 +234,9 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	}
 	if md.IsDefined("listen_addrs") {
 		dst.ListenAddrs = append([]string(nil), src.ListenAddrs...)
+	}
+	if md.IsDefined("advertise") {
+		dst.Advertise = src.Advertise
 	}
 	if md.IsDefined("readonly") {
 		dst.Readonly = src.Readonly
@@ -253,6 +314,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("listen_addrs") {
 		record("listen_addrs")
 	}
+	if md.IsDefined("advertise") {
+		record("advertise")
+	}
 	if md.IsDefined("readonly") {
 		record("readonly")
 	}
@@ -315,6 +379,8 @@ func configValueString(cfg *Config, key string) string {
 		return cfg.Listen
 	case "listen_addrs":
 		return strings.Join(cfg.ListenAddrs, ",")
+	case "advertise":
+		return strconv.FormatBool(cfg.Advertise)
 	case "readonly":
 		return strconv.FormatBool(cfg.Readonly)
 	case "verbose":
@@ -499,16 +565,24 @@ var (
 )
 
 func main() {
-	// Check for stop subcommand before flag parsing
-	if len(os.Args) > 1 && os.Args[1] == "stop" {
-		stopDaemon()
-		return
+	// Check subcommands before flag parsing.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "stop":
+			stopDaemon()
+			return
+		case "status":
+			statusDaemon()
+			return
+		}
 	}
 
 	// CLI flags
 	shareSpecs := pflag.StringArrayP("name", "n", []string{}, "Share specification (name:path or just name)")
 	listenAddrs := pflag.StringArrayP("listen", "l", []string{}, "Address or @interface to listen on (repeatable)")
 	allowAddrs := pflag.StringArrayP("allow", "a", []string{}, "Allow client IP/CIDR (repeatable)")
+	advertise := pflag.Bool("advertise", true, "Advertise shares via mDNS + WS-Discovery")
+	noAdvertise := pflag.Bool("no-advertise", false, "Disable share advertisement")
 	readOnly := pflag.BoolP("readonly", "r", false, "Make share read-only")
 	showVersion := pflag.BoolP("version", "V", false, "Show version")
 	showHelp := pflag.BoolP("help", "h", false, "Show help")
@@ -557,6 +631,11 @@ func main() {
 		if !pflag.CommandLine.Changed("readonly") && config.Readonly {
 			*readOnly = true
 		}
+		if !pflag.CommandLine.Changed("advertise") && !pflag.CommandLine.Changed("no-advertise") {
+			if _, ok := configInfo.SettingSrc["advertise"]; ok {
+				*advertise = config.Advertise
+			}
+		}
 		if !pflag.CommandLine.Changed("verbose") {
 			if config.VerboseLevel > 0 {
 				*verbose = config.VerboseLevel
@@ -585,6 +664,9 @@ func main() {
 
 	if len(*listenAddrs) == 0 {
 		*listenAddrs = []string{"0.0.0.0:445"}
+	}
+	if *noAdvertise {
+		*advertise = false
 	}
 	authUsers, err := buildAuthUsers(*userSpecs, *password, pflag.CommandLine.Changed("username"), pflag.CommandLine.Changed("password"), config)
 	if err != nil {
@@ -619,6 +701,7 @@ func main() {
 		effectiveConfig.ListenAddrs = append([]string(nil), *listenAddrs...)
 	}
 	effectiveConfig.Readonly = *readOnly
+	effectiveConfig.Advertise = *advertise
 	effectiveConfig.HideDotfiles = *hideDotfiles
 	if len(authUsers) > 1 {
 		effectiveConfig.Users = authUsersToConfig(authUsers)
@@ -654,6 +737,9 @@ func main() {
 	}
 	if pflag.CommandLine.Changed("readonly") {
 		markCLI("readonly")
+	}
+	if pflag.CommandLine.Changed("advertise") || pflag.CommandLine.Changed("no-advertise") {
+		markCLI("advertise")
 	}
 	if pflag.CommandLine.Changed("verbose") {
 		if *verbose <= 1 {
@@ -715,7 +801,7 @@ func main() {
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *advertise, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
@@ -1012,13 +1098,27 @@ func main() {
 			printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, true, extraVerbose)
 			printConfigLogs()
 
+			// Persist daemon status snapshot for `sambam status`.
+			statusPath := daemonStatusFilePath(*pidFile)
+			status := daemonStatus{
+				PID:        child.Pid,
+				PIDFile:    *pidFile,
+				LogFile:    logFileName,
+				Shares:     shares,
+				Listen:     listenDisplay,
+				Auth:       authDisplay(authUsers),
+				AllowAddrs: append([]string(nil), *allowAddrs...),
+				UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
+			}
+			if err := writeDaemonStatus(statusPath, status); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write status file %s: %v\n", statusPath, err)
+			}
+
 			fmt.Println()
 			fmt.Printf("  %-12s %s\n", "Status", Green("daemon started"))
 			fmt.Printf("  %-12s %d\n", "PID", child.Pid)
 			fmt.Printf("  %-12s %s\n", "PID file", *pidFile)
-			if *logFile != "" {
-				fmt.Printf("  %-12s %s\n", "Log file", *logFile)
-			}
+			fmt.Printf("  %-12s %s\n", "Log file", logFileName)
 			fmt.Printf("  %-12s %s\n", "Control", Cyan("sambam stop"))
 			os.Exit(0)
 		}
@@ -1161,6 +1261,17 @@ func main() {
 		vfsShares,
 	)
 
+	// Optional Bonjour/mDNS + WS-Discovery advertisement for discovery.
+	var discovery *discoveryAdvertiser
+	if *advertise {
+		discovery, err = startSMBAdvertiser(shares, listenEndpoints, listenPort, authUsers, *allowAddrs)
+		if err != nil {
+			logrus.Warnf("advertise disabled: %v", err)
+		} else {
+			logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
+		}
+	}
+
 	// Print banner in foreground mode.
 	if !*daemonMode {
 		printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, false, extraVerbose)
@@ -1240,6 +1351,9 @@ func main() {
 		log.Println("Shutting down...")
 	} else if !*daemonMode {
 		fmt.Println("\nShutting down...")
+	}
+	if discovery != nil {
+		discovery.Shutdown()
 	}
 	srv.Shutdown()
 }
@@ -1442,6 +1556,7 @@ func printUsage() {
 	fmt.Println(Bold("  Usage:"))
 	fmt.Printf("    %s [options] [directory]\n", Cyan("sambam"))
 	fmt.Printf("    %s\n", Cyan("sambam stop"))
+	fmt.Printf("    %s\n", Cyan("sambam status"))
 	fmt.Println()
 	fmt.Println(Bold("  Options:"))
 	printOpt := func(label, desc string) {
@@ -1456,6 +1571,8 @@ func printUsage() {
 	printOpt("-n, --name", "Share name or name:path "+Dim("(repeatable)"))
 	printOpt("-l, --listen", "Address or @interface to listen on "+Dim("(repeatable, default: 0.0.0.0:445)"))
 	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
+	printOpt("    --advertise", "Advertise shares via "+Dim("mDNS (_smb._tcp) + WS-Discovery (default: on)"))
+	printOpt("    --no-advertise", "Disable share advertisement")
 	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-u, --username", "Require authentication "+Dim("(user or user:password, repeatable)"))
 	printOpt("-p, --password", "Password "+Dim("(random if not set)"))
@@ -1478,6 +1595,7 @@ func printUsage() {
 	printExample("sambam", "Share current directory")
 	printExample("sambam -n docs:/docs -n pics:/photos -r", "Multi-share read-only")
 	printExample("sambam -d -l 10.23.22.13:445 -u admin -p secret /data", "Daemon + auth + custom listen")
+	printExample("sambam status", "Show current daemon status")
 	fmt.Println()
 }
 
@@ -1511,7 +1629,7 @@ func normalizeCLIArgs(args []string) []string {
 	return out
 }
 
-func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, userSpecs []string, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
+func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, advertise bool, readOnly bool, verbose int, hideDotfiles bool, userSpecs []string, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
 	var b bytes.Buffer
 	written := []string{}
 	writeUserReadonly := false
@@ -1551,6 +1669,9 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	}
 	if pflag.CommandLine.Changed("allow") {
 		writeStringArray("allow", allowAddrs)
+	}
+	if pflag.CommandLine.Changed("advertise") || pflag.CommandLine.Changed("no-advertise") {
+		writeBool("advertise", advertise)
 	}
 	if pflag.CommandLine.Changed("verbose") {
 		if verbose <= 1 {
@@ -1765,6 +1886,515 @@ func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
 		return nil, "", fmt.Errorf("no listen endpoints configured")
 	}
 	return endpoints, commonPort, nil
+}
+
+func startSMBAdvertiser(shares []Share, endpoints []listenEndpoint, listenPort string, users []authUser, allowAddrs []string) (*discoveryAdvertiser, error) {
+	if len(shares) == 0 {
+		return nil, fmt.Errorf("no shares to advertise")
+	}
+	port, err := strconv.Atoi(listenPort)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid advertise port: %q", listenPort)
+	}
+
+	shareNames := make([]string, 0, len(shares))
+	for _, s := range shares {
+		shareNames = append(shareNames, s.Name)
+	}
+	sort.Strings(shareNames)
+
+	instance := "sambam-" + shareNames[0]
+	if len(shareNames) > 1 {
+		instance = fmt.Sprintf("sambam-%d-shares", len(shareNames))
+	}
+	if len(instance) > 63 {
+		instance = instance[:63]
+	}
+
+	authMode := "anonymous"
+	if len(users) > 0 {
+		authMode = "auth"
+	}
+	txt := []string{
+		"vendor=sambam",
+		"service=smb",
+		"shares=" + strings.Join(shareNames, ","),
+		"auth=" + authMode,
+	}
+	if len(allowAddrs) > 0 {
+		txt = append(txt, "allow="+strings.Join(allowAddrs, ","))
+	}
+
+	adv := &discoveryAdvertiser{}
+	var errs []string
+
+	// zeroconf advertises on active interfaces automatically when ifaces=nil.
+	s, err := zeroconf.Register(instance, "_smb._tcp", "local.", port, txt, nil)
+	if err != nil {
+		errs = append(errs, "mDNS: "+err.Error())
+	} else {
+		adv.mdns = s
+	}
+
+	wsd, err := startWSDiscovery(shares, endpoints)
+	if err != nil {
+		errs = append(errs, "WSD: "+err.Error())
+	} else {
+		adv.wsd = wsd
+	}
+
+	if adv.mdns == nil && adv.wsd == nil {
+		return nil, errors.New(strings.Join(errs, "; "))
+	}
+	if len(errs) > 0 {
+		logrus.Warnf("advertise partial: %s", strings.Join(errs, "; "))
+	}
+	return adv, nil
+}
+
+func advertiseIPsFromEndpoints(endpoints []listenEndpoint) []string {
+	out := []string{}
+	seen := map[string]struct{}{}
+	for _, ep := range endpoints {
+		if ep.Wildcard {
+			continue
+		}
+		if _, ok := seen[ep.IP]; ok {
+			continue
+		}
+		seen[ep.IP] = struct{}{}
+		out = append(out, ep.IP)
+	}
+	if len(out) > 0 {
+		return out
+	}
+	for _, ip := range getLocalIPs() {
+		if ip == "<your-ip>" {
+			continue
+		}
+		if _, ok := seen[ip]; ok {
+			continue
+		}
+		seen[ip] = struct{}{}
+		out = append(out, ip)
+	}
+	return out
+}
+
+func stableUUIDFromSeed(seed string) string {
+	sum := sha1.Sum([]byte(seed))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x50 // version 5
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC4122 variant
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func randomUUIDURN() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "urn:uuid:00000000-0000-0000-0000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("urn:uuid:%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func xmlFieldValue(xml, local string) string {
+	open := "<" + local + ">"
+	close := "</" + local + ">"
+	if i := strings.Index(xml, open); i >= 0 {
+		j := strings.Index(xml[i+len(open):], close)
+		if j >= 0 {
+			return strings.TrimSpace(xml[i+len(open) : i+len(open)+j])
+		}
+	}
+	open = "<wsa:" + local + ">"
+	close = "</wsa:" + local + ">"
+	if i := strings.Index(xml, open); i >= 0 {
+		j := strings.Index(xml[i+len(open):], close)
+		if j >= 0 {
+			return strings.TrimSpace(xml[i+len(open) : i+len(open)+j])
+		}
+	}
+	open = "<a:" + local + ">"
+	close = "</a:" + local + ">"
+	if i := strings.Index(xml, open); i >= 0 {
+		j := strings.Index(xml[i+len(open):], close)
+		if j >= 0 {
+			return strings.TrimSpace(xml[i+len(open) : i+len(open)+j])
+		}
+	}
+	return ""
+}
+
+func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryService, error) {
+	ips := advertiseIPsFromEndpoints(endpoints)
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no usable IP addresses for WSD")
+	}
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "sambam"
+	}
+	workgroup := strings.TrimSpace(os.Getenv("SAMBA_WORKGROUP"))
+	if workgroup == "" {
+		workgroup = strings.TrimSpace(os.Getenv("WORKGROUP"))
+	}
+	if workgroup == "" {
+		workgroup = "WORKGROUP"
+	}
+	shareNames := make([]string, 0, len(shares))
+	for _, s := range shares {
+		shareNames = append(shareNames, s.Name)
+	}
+	sort.Strings(shareNames)
+	seed := hostname + "|" + strings.Join(shareNames, ",")
+	uuid := stableUUIDFromSeed(seed)
+
+	mcast := &net.UDPAddr{IP: net.ParseIP("239.255.255.250"), Port: 3702}
+	conn, err := net.ListenMulticastUDP("udp4", nil, mcast)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetReadBuffer(1 << 20)
+
+	wsd := &wsDiscoveryService{
+		conn:            conn,
+		multicastAddr:   mcast,
+		endpointAddress: "urn:uuid:" + uuid,
+		endpointUUID:    uuid,
+		xaddr:           fmt.Sprintf("http://%s:5357/sambam/wsd", ips[0]),
+		xaddrs:          make([]string, 0, len(ips)),
+		friendlyName:    hostname,
+		manufacturer:    "sambam",
+		workgroup:       workgroup,
+		scopes:          "smb://" + ips[0] + "/",
+		metadataVersion: 1,
+		sequenceID:      randomUUIDURN(),
+		stop:            make(chan struct{}),
+	}
+	for _, ip := range ips {
+		wsd.xaddrs = append(wsd.xaddrs, fmt.Sprintf("http://%s:5357/%s", ip, wsd.endpointUUID))
+	}
+	wsd.xaddr = wsd.xaddrs[0]
+	if err := wsd.startMetadataHTTP("0.0.0.0"); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	logrus.Debugf("wsd init: endpoint=%s xaddrs=%s scopes=%s", wsd.endpointAddress, strings.Join(wsd.xaddrs, ","), wsd.scopes)
+	wsd.wg.Add(1)
+	go wsd.serve()
+	wsd.sendHello()
+	return wsd, nil
+}
+
+func (w *wsDiscoveryService) Shutdown() {
+	close(w.stop)
+	w.sendBye()
+	_ = w.conn.Close()
+	if w.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		_ = w.httpServer.Shutdown(ctx)
+		cancel()
+	}
+	w.wg.Wait()
+}
+
+func (w *wsDiscoveryService) serve() {
+	defer w.wg.Done()
+	buf := make([]byte, 64*1024)
+	for {
+		_ = w.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		n, src, err := w.conn.ReadFromUDP(buf)
+		select {
+		case <-w.stop:
+			return
+		default:
+		}
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			continue
+		}
+		msg := string(buf[:n])
+		lower := strings.ToLower(msg)
+		action := xmlFieldValue(msg, "Action")
+		msgID := xmlFieldValue(msg, "MessageID")
+		if action != "" || msgID != "" {
+			logrus.Debugf("wsd recv: from=%s action=%s message_id=%s bytes=%d", src.String(), action, msgID, n)
+		} else {
+			logrus.Tracef("wsd recv: from=%s bytes=%d", src.String(), n)
+		}
+		if strings.Contains(lower, "ws-discovery/2009/01/probe") ||
+			strings.Contains(lower, "ws/2005/04/discovery/probe") ||
+			strings.Contains(lower, "<d:probe") || strings.Contains(lower, "<probe") {
+			logrus.Debugf("wsd probe: from=%s", src.String())
+			w.sendProbeMatch(src, xmlFieldValue(msg, "MessageID"))
+			continue
+		}
+		if strings.Contains(lower, "ws-discovery/2009/01/resolve") ||
+			strings.Contains(lower, "ws/2005/04/discovery/resolve") ||
+			strings.Contains(lower, "<d:resolve") || strings.Contains(lower, "<resolve") {
+			logrus.Debugf("wsd resolve: from=%s", src.String())
+			requestedEndpoint := xmlFieldValue(msg, "Address")
+			if requestedEndpoint != "" && !strings.EqualFold(requestedEndpoint, w.endpointAddress) {
+				logrus.Debugf("wsd resolve skip: from=%s requested=%s local=%s", src.String(), requestedEndpoint, w.endpointAddress)
+				continue
+			}
+			w.sendResolveMatch(src, xmlFieldValue(msg, "MessageID"))
+		}
+	}
+}
+
+func (w *wsDiscoveryService) sendTo(addr *net.UDPAddr, payload string) {
+	if w.conn == nil {
+		logrus.Tracef("wsd send error: dst=%s err=nil socket", addr.String())
+		return
+	}
+	n, err := w.conn.WriteToUDP([]byte(payload), addr)
+	if err != nil {
+		logrus.Tracef("wsd send error: dst=%s err=%v", addr.String(), err)
+		return
+	}
+	src := ""
+	if la := w.conn.LocalAddr(); la != nil {
+		src = la.String()
+	}
+	logrus.Tracef("wsd send: src=%s dst=%s bytes=%d wrote=%d", src, addr.String(), len(payload), n)
+}
+
+func (w *wsDiscoveryService) sendHello() {
+	xaddrList := w.xaddrListFor(nil)
+	appSeq := w.appSequenceHeader()
+	msg := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+ xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+ xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+<e:Header>
+<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello</wsa:Action>
+<wsa:MessageID>%s</wsa:MessageID>
+<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>
+%s
+</e:Header>
+<e:Body>
+<d:Hello>
+<wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference>
+<d:Types>wsdp:Device pub:Computer</d:Types>
+<d:Scopes>%s</d:Scopes>
+<d:XAddrs>%s</d:XAddrs>
+<d:MetadataVersion>%d</d:MetadataVersion>
+</d:Hello>
+</e:Body>
+</e:Envelope>`, randomUUIDURN(), appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
+	w.sendTo(w.multicastAddr, msg)
+	logrus.Debugf("wsd hello: endpoint=%s xaddrs=%s", w.endpointAddress, xaddrList)
+}
+
+func (w *wsDiscoveryService) sendBye() {
+	appSeq := w.appSequenceHeader()
+	msg := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">
+<e:Header>
+<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Bye</wsa:Action>
+<wsa:MessageID>%s</wsa:MessageID>
+<wsa:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</wsa:To>
+%s
+</e:Header>
+<e:Body>
+<d:Bye><wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference></d:Bye>
+</e:Body>
+</e:Envelope>`, randomUUIDURN(), appSeq, w.endpointAddress)
+	w.sendTo(w.multicastAddr, msg)
+	logrus.Debugf("wsd bye: endpoint=%s", w.endpointAddress)
+}
+
+func (w *wsDiscoveryService) sendProbeMatch(dst *net.UDPAddr, relatesTo string) {
+	rel := ""
+	if relatesTo != "" {
+		rel = "<wsa:RelatesTo>" + relatesTo + "</wsa:RelatesTo>"
+	}
+	xaddrList := w.xaddrListFor(dst)
+	appSeq := w.appSequenceHeader()
+	msg := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+ xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+ xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+<e:Header>
+<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
+<wsa:MessageID>%s</wsa:MessageID>
+%s
+<wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+%s
+</e:Header>
+<e:Body>
+<d:ProbeMatches>
+<d:ProbeMatch>
+<wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference>
+<d:Types>wsdp:Device pub:Computer</d:Types>
+<d:Scopes>%s</d:Scopes>
+<d:XAddrs>%s</d:XAddrs>
+<d:MetadataVersion>%d</d:MetadataVersion>
+</d:ProbeMatch>
+</d:ProbeMatches>
+</e:Body>
+</e:Envelope>`, randomUUIDURN(), rel, appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
+	w.sendTo(dst, msg)
+	logrus.Debugf("wsd probe match: to=%s relates_to=%s xaddrs=%s", dst.String(), relatesTo, xaddrList)
+}
+
+func (w *wsDiscoveryService) sendResolveMatch(dst *net.UDPAddr, relatesTo string) {
+	rel := ""
+	if relatesTo != "" {
+		rel = "<wsa:RelatesTo>" + relatesTo + "</wsa:RelatesTo>"
+	}
+	xaddrList := w.xaddrListFor(dst)
+	appSeq := w.appSequenceHeader()
+	msg := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery"
+ xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+ xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+<e:Header>
+<wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ResolveMatches</wsa:Action>
+<wsa:MessageID>%s</wsa:MessageID>
+%s
+<wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+%s
+</e:Header>
+<e:Body>
+<d:ResolveMatches>
+<d:ResolveMatch>
+<wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference>
+<d:Types>wsdp:Device pub:Computer</d:Types>
+<d:Scopes>%s</d:Scopes>
+<d:XAddrs>%s</d:XAddrs>
+<d:MetadataVersion>%d</d:MetadataVersion>
+</d:ResolveMatch>
+</d:ResolveMatches>
+</e:Body>
+</e:Envelope>`, randomUUIDURN(), rel, appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
+	w.sendTo(dst, msg)
+	logrus.Debugf("wsd resolve match: to=%s relates_to=%s endpoint=%s xaddrs=%s", dst.String(), relatesTo, w.endpointAddress, xaddrList)
+}
+
+func (w *wsDiscoveryService) xaddrListFor(dst *net.UDPAddr) string {
+	if len(w.xaddrs) == 0 {
+		return w.xaddr
+	}
+	if dst == nil || dst.IP == nil {
+		return strings.Join(w.xaddrs, " ")
+	}
+	client4 := dst.IP.To4()
+	if client4 == nil {
+		return strings.Join(w.xaddrs, " ")
+	}
+	prefix := fmt.Sprintf("http://%d.%d.%d.", client4[0], client4[1], client4[2])
+	for _, xa := range w.xaddrs {
+		if strings.HasPrefix(xa, prefix) {
+			return xa
+		}
+	}
+	return strings.Join(w.xaddrs, " ")
+}
+
+func (w *wsDiscoveryService) metadataXML(relatesTo string) string {
+	rel := ""
+	if relatesTo != "" {
+		rel = "<wsa:RelatesTo>" + relatesTo + "</wsa:RelatesTo>"
+	}
+	computerID := fmt.Sprintf("%s/Workgroup:%s", strings.ToUpper(w.friendlyName), strings.ToUpper(w.workgroup))
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+ xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+ xmlns:wsx="http://schemas.xmlsoap.org/ws/2004/09/mex"
+ xmlns:wsdp="http://schemas.xmlsoap.org/ws/2006/02/devprof"
+ xmlns:pnpx="http://schemas.microsoft.com/windows/pnpx/2005/10"
+ xmlns:pub="http://schemas.microsoft.com/windows/pub/2005/07">
+<soap:Header>
+<wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse</wsa:Action>
+<wsa:MessageID>%s</wsa:MessageID>
+%s
+<wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
+</soap:Header>
+<soap:Body>
+<wsx:Metadata>
+<wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisDevice">
+<wsdp:ThisDevice>
+<wsdp:FriendlyName>%s</wsdp:FriendlyName>
+<wsdp:FirmwareVersion>1.0</wsdp:FirmwareVersion>
+<wsdp:SerialNumber>%s</wsdp:SerialNumber>
+</wsdp:ThisDevice>
+</wsx:MetadataSection>
+<wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/ThisModel">
+<wsdp:ThisModel>
+<wsdp:Manufacturer>%s</wsdp:Manufacturer>
+<wsdp:ModelName>sambam SMB Server</wsdp:ModelName>
+<wsdp:ModelNumber>%s</wsdp:ModelNumber>
+<pnpx:DeviceCategory>Computers</pnpx:DeviceCategory>
+</wsdp:ThisModel>
+</wsx:MetadataSection>
+<wsx:MetadataSection Dialect="http://schemas.xmlsoap.org/ws/2006/02/devprof/Relationship">
+<wsdp:Relationship Type="http://schemas.xmlsoap.org/ws/2006/02/devprof/host">
+<wsdp:Host>
+<wsa:EndpointReference><wsa:Address>%s</wsa:Address></wsa:EndpointReference>
+<wsdp:Types>pub:Computer</wsdp:Types>
+<wsdp:ServiceId>%s</wsdp:ServiceId>
+<pub:Computer>%s</pub:Computer>
+</wsdp:Host>
+</wsdp:Relationship>
+</wsx:MetadataSection>
+</wsx:Metadata>
+</soap:Body>
+</soap:Envelope>`, randomUUIDURN(), rel, w.friendlyName, w.endpointAddress, w.manufacturer, version, w.endpointAddress, w.endpointAddress, computerID)
+}
+
+func (w *wsDiscoveryService) appSequenceHeader() string {
+	msgNum := atomic.AddUint64(&w.messageNumber, 1)
+	return fmt.Sprintf(`<d:AppSequence InstanceId="1" SequenceId="%s" MessageNumber="%d"/>`, w.sequenceID, msgNum)
+}
+
+func (w *wsDiscoveryService) startMetadataHTTP(bindIP string) error {
+	mux := http.NewServeMux()
+	handler := func(rw http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		bodyXML := string(body)
+		action := xmlFieldValue(bodyXML, "Action")
+		messageID := xmlFieldValue(bodyXML, "MessageID")
+		logrus.Debugf("wsd metadata: method=%s remote=%s path=%s action=%s message_id=%s bytes=%d", r.Method, r.RemoteAddr, r.URL.Path, action, messageID, len(body))
+		resp := w.metadataXML(messageID)
+		rw.Header().Set("Content-Type", `application/soap+xml; charset=utf-8; action="http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse"`)
+		_, _ = io.WriteString(rw, resp)
+	}
+	mux.HandleFunc("/sambam/wsd", handler)
+	mux.HandleFunc("/", handler)
+	srv := &http.Server{
+		Addr:              net.JoinHostPort(bindIP, "5357"),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	w.httpServer = srv
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logrus.Debugf("wsd metadata http stopped: %v", err)
+		}
+	}()
+	logrus.Debugf("wsd metadata http: listening=%s", srv.Addr)
+	return nil
 }
 
 func buildAuthUsers(cliUsers []string, cliPassword string, cliUsersChanged bool, cliPasswordChanged bool, cfg *Config) ([]authUser, error) {
@@ -2058,7 +2688,7 @@ func stopDaemon() {
 	}
 
 	// Parse PID
-	pid, err := strconv.Atoi(string(data))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid PID in file: %v\n", err)
 		os.Exit(1)
@@ -2089,9 +2719,170 @@ func stopDaemon() {
 			fmt.Println("Daemon stopped")
 			// Clean up PID file if it still exists
 			os.Remove(pidFilePath)
+			os.Remove(daemonStatusFilePath(pidFilePath))
 			return
 		}
 	}
 
 	fmt.Fprintln(os.Stderr, "Warning: Daemon may not have stopped cleanly")
+}
+
+func daemonStatusFilePath(pidFile string) string {
+	return pidFile + ".status"
+}
+
+func writeDaemonStatus(path string, status daemonStatus) error {
+	data, err := json.MarshalIndent(status, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func readDaemonStatus(path string) (*daemonStatus, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st daemonStatus
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+func parseSubcommandPIDFile(defaultPath string, args []string) string {
+	pidFilePath := defaultPath
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case a == "-P" || a == "--pidfile":
+			if i+1 < len(args) {
+				pidFilePath = args[i+1]
+			}
+		case strings.HasPrefix(a, "--pidfile="):
+			pidFilePath = strings.TrimPrefix(a, "--pidfile=")
+		}
+	}
+	return pidFilePath
+}
+
+func isProcessRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func renderStatusBlock(st *daemonStatus) {
+	fmt.Println()
+	if len(st.Shares) == 1 {
+		fmt.Printf("  %-12s %s\n", "Sharing", Green(st.Shares[0].Path))
+		fmt.Printf("  %-12s %s\n", "Share", Yellow(st.Shares[0].Name))
+	} else {
+		maxLen := 0
+		for _, share := range st.Shares {
+			if len(share.Name) > maxLen {
+				maxLen = len(share.Name)
+			}
+		}
+		if maxLen < 11 {
+			maxLen = 11
+		}
+		fmt.Printf("  %s\n", "Shares:")
+		for _, share := range st.Shares {
+			padding := strings.Repeat(" ", maxLen-len(share.Name))
+			fmt.Printf("    %s%s %s %s\n", Yellow(share.Name), padding, Dim("→"), Green(share.Path))
+		}
+	}
+
+	listenColored := Yellow(st.Listen)
+	listenHost, _ := parseHostPort(st.Listen)
+	if listenHost == "" || listenHost == "0.0.0.0" || listenHost == "::" {
+		listenColored = Dim(st.Listen)
+	}
+	fmt.Printf("  %-12s %s\n", "Listen", listenColored)
+
+	modeStr := Red("read-write")
+	roCount := 0
+	for _, s := range st.Shares {
+		if s.ReadOnly {
+			roCount++
+		}
+	}
+	if roCount == len(st.Shares) {
+		modeStr = Green("read-only")
+	} else if roCount > 0 {
+		modeStr = Yellow("mixed")
+	}
+	fmt.Printf("  %-12s %s\n", "Mode", modeStr)
+	fmt.Printf("  %-12s %s\n", "Auth", st.Auth)
+
+	allowTextColored := Dim("all")
+	if len(st.AllowAddrs) > 0 {
+		allowTextColored = Yellow(strings.Join(st.AllowAddrs, ", "))
+	}
+	fmt.Printf("  %-12s %s\n", "Allowlist", allowTextColored)
+	fmt.Println()
+	fmt.Printf("  %-12s %s\n", "Status", Green("daemon started"))
+	fmt.Printf("  %-12s %d\n", "PID", st.PID)
+	fmt.Printf("  %-12s %s\n", "PID file", st.PIDFile)
+	fmt.Printf("  %-12s %s\n", "Log file", st.LogFile)
+}
+
+func statusDaemon() {
+	pidFilePath := parseSubcommandPIDFile("/tmp/sambam.pid", os.Args[2:])
+	statusPath := daemonStatusFilePath(pidFilePath)
+
+	data, err := os.ReadFile(pidFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "No daemon running (PID file not found: %s)\n", pidFilePath)
+		} else {
+			fmt.Fprintf(os.Stderr, "Error reading PID file: %v\n", err)
+		}
+		os.Exit(1)
+	}
+
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid PID in file: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !isProcessRunning(pid) {
+		_ = os.Remove(pidFilePath)
+		_ = os.Remove(statusPath)
+		fmt.Fprintf(os.Stderr, "No daemon running (stale PID %d in %s)\n", pid, pidFilePath)
+		os.Exit(1)
+	}
+
+	st, err := readDaemonStatus(statusPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Daemon is running (PID %d), but status file is missing: %s\n", pid, statusPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "Daemon is running (PID %d), but status file is unreadable: %v\n", pid, err)
+		}
+		os.Exit(1)
+	}
+
+	// Trust live PID from pidfile even if status snapshot is stale.
+	st.PID = pid
+	if st.PIDFile == "" {
+		st.PIDFile = pidFilePath
+	}
+	if st.LogFile == "" {
+		st.LogFile = "/dev/null"
+	}
+	renderStatusBlock(st)
 }

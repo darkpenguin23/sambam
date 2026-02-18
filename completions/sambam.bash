@@ -7,9 +7,9 @@ _sambam_complete()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local global_flags="--name --listen --allow --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
-    local stop_flags="--pidfile --help"
-    local cmds="stop"
+    local global_flags="--name --listen --allow --advertise --no-advertise --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
+    local subcmd_flags="--pidfile --help"
+    local cmds="stop status"
     local _path_candidates
 
     _sambam_complete_path() {
@@ -52,15 +52,15 @@ _sambam_complete()
             ;;
     esac
 
-    # Subcommand-aware completion for "sambam stop ...".
-    if [[ ${#COMP_WORDS[@]} -ge 2 && ${COMP_WORDS[1]} == "stop" ]]; then
+    # Subcommand-aware completion for "sambam stop|status ...".
+    if [[ ${#COMP_WORDS[@]} -ge 2 && ( ${COMP_WORDS[1]} == "stop" || ${COMP_WORDS[1]} == "status" ) ]]; then
         case "$prev" in
             -P|--pidfile)
                 _sambam_complete_path
                 return 0
                 ;;
         esac
-        COMPREPLY=( $(compgen -W "$stop_flags" -- "$cur") )
+        COMPREPLY=( $(compgen -W "$subcmd_flags" -- "$cur") )
         return 0
     fi
 

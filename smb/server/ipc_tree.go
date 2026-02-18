@@ -2,6 +2,7 @@ package smb2
 
 import (
 	"reflect"
+	"time"
 
 	. "github.com/sambam/sambam/smb/internal/erref"
 	. "github.com/sambam/sambam/smb/internal/smb2"
@@ -91,6 +92,7 @@ func (t *ipcTree) write(ctx *compoundContext, pkt []byte) error {
 	r := WriteRequestDecoder(res)
 
 	t.dceReq = r.Data()
+	log.Tracef("ipc write: dce-bytes=%d", len(t.dceReq))
 	rsp := new(WriteResponse)
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)
 	rsp.Count = uint32(len(t.dceReq))
@@ -99,6 +101,7 @@ func (t *ipcTree) write(ctx *compoundContext, pkt []byte) error {
 
 func (t *ipcTree) read(ctx *compoundContext, pkt []byte) error {
 	c := t.session.conn
+	start := time.Now()
 
 	rsp := new(ReadResponse)
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)
@@ -137,10 +140,12 @@ func (t *ipcTree) read(ctx *compoundContext, pkt []byte) error {
 
 	rsp.Data = make([]byte, rpc.Size())
 	rpc.Encode(rsp.Data)
+	log.Tracef("ipc read: rpc-response-bytes=%d dur=%s", len(rsp.Data), time.Since(start))
 	return c.sendPacket(rsp, &t.treeConn, ctx)
 }
 
 func (t *ipcTree) ipcTreeBindReq(ctx *compoundContext, pkt []byte) (Encoder, error) {
+	start := time.Now()
 
 	dceReq := DCERequestDecoder(pkt)
 	bindReq := DCEBindRequestDecoder(pkt)
@@ -180,35 +185,41 @@ func (t *ipcTree) ipcTreeBindReq(ctx *compoundContext, pkt []byte) (Encoder, err
 	rpc.SecAddrLen = 13
 	rpc.CtxCount = uint8(len(ctxRsp))
 	rpc.CtxItems = ctxRsp
+	log.Tracef("ipc bind: callid=%d contexts=%d dur=%s", dceReq.Header().CallID, len(ctxRsp), time.Since(start))
 
 	return rpc, nil
 }
 
 func (t *ipcTree) ipcTreeReq(ctx *compoundContext, pkt []byte) (Encoder, error) {
+	start := time.Now()
 
 	dceReq := DCERequestDecoder(pkt)
 	req := DCERequestReqDecoder(pkt)
+	op := req.Opnum()
 
 	var data Encoder
-	switch req.Opnum() {
+	switch op {
 	case OpNetShareEnumAll:
 		data = MakeNetShareEnumAllResponse(t.shares)
 	case OpNetShareGetInfo:
 		infoReq := NetShareGetInfoRequestDecoder(req.Data())
 		data = MakeGetInfoShareResponse(infoReq.ShareName())
 	default:
+		log.Tracef("ipc rpc: callid=%d opnum=%d (%s) unsupported dur=%s", dceReq.Header().CallID, op, rpcOpName(op), time.Since(start))
 		return nil, &RequestError{Code: uint32(STATUS_NOT_SUPPORTED)}
 	}
 
 	rpc := new(DCERequestRes)
 	rpc.CallID = dceReq.Header().CallID
 	rpc.Data = data
+	log.Tracef("ipc rpc: callid=%d opnum=%d (%s) req-bytes=%d dur=%s", dceReq.Header().CallID, op, rpcOpName(op), len(req.Data()), time.Since(start))
 
 	return rpc, nil
 }
 
 func (t *ipcTree) ioctl(ctx *compoundContext, pkt []byte) error {
 	c := t.session.conn
+	start := time.Now()
 
 	res, err := accept(SMB2_IOCTL, pkt)
 	if err != nil {
@@ -280,8 +291,20 @@ func (t *ipcTree) ioctl(ctx *compoundContext, pkt []byte) error {
 	rsp.CtlCode = FSCTL_PIPE_TRANSCEIVE
 	rsp.FileId = &SRVSVC_GUID
 	rsp.Output = rpc
+	log.Tracef("ipc ioctl: ctl=0x%x rpc-bytes=%d dur=%s", r.CtlCode(), rpc.Size(), time.Since(start))
 
 	return c.sendPacket(rsp, &t.treeConn, ctx)
+}
+
+func rpcOpName(op uint16) string {
+	switch op {
+	case OpNetShareEnumAll:
+		return "NetShareEnumAll"
+	case OpNetShareGetInfo:
+		return "NetShareGetInfo"
+	default:
+		return "Unknown"
+	}
 }
 
 func (t *ipcTree) cancel(ctx *compoundContext, pkt []byte) error {
