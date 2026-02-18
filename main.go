@@ -581,7 +581,6 @@ func main() {
 	shareSpecs := pflag.StringArrayP("name", "n", []string{}, "Share specification (name:path or just name)")
 	listenAddrs := pflag.StringArrayP("listen", "l", []string{}, "Address or @interface to listen on (repeatable)")
 	allowAddrs := pflag.StringArrayP("allow", "a", []string{}, "Allow client IP/CIDR (repeatable)")
-	advertise := pflag.Bool("advertise", true, "Advertise shares via mDNS + WS-Discovery")
 	noAdvertise := pflag.Bool("no-advertise", false, "Disable share advertisement")
 	readOnly := pflag.BoolP("readonly", "r", false, "Make share read-only")
 	showVersion := pflag.BoolP("version", "V", false, "Show version")
@@ -631,11 +630,6 @@ func main() {
 		if !pflag.CommandLine.Changed("readonly") && config.Readonly {
 			*readOnly = true
 		}
-		if !pflag.CommandLine.Changed("advertise") && !pflag.CommandLine.Changed("no-advertise") {
-			if _, ok := configInfo.SettingSrc["advertise"]; ok {
-				*advertise = config.Advertise
-			}
-		}
 		if !pflag.CommandLine.Changed("verbose") {
 			if config.VerboseLevel > 0 {
 				*verbose = config.VerboseLevel
@@ -665,8 +659,14 @@ func main() {
 	if len(*listenAddrs) == 0 {
 		*listenAddrs = []string{"0.0.0.0:445"}
 	}
+	advertiseEnabled := true
+	if config != nil {
+		if _, ok := configInfo.SettingSrc["advertise"]; ok {
+			advertiseEnabled = config.Advertise
+		}
+	}
 	if *noAdvertise {
-		*advertise = false
+		advertiseEnabled = false
 	}
 	authUsers, err := buildAuthUsers(*userSpecs, *password, pflag.CommandLine.Changed("username"), pflag.CommandLine.Changed("password"), config)
 	if err != nil {
@@ -701,7 +701,7 @@ func main() {
 		effectiveConfig.ListenAddrs = append([]string(nil), *listenAddrs...)
 	}
 	effectiveConfig.Readonly = *readOnly
-	effectiveConfig.Advertise = *advertise
+	effectiveConfig.Advertise = advertiseEnabled
 	effectiveConfig.HideDotfiles = *hideDotfiles
 	if len(authUsers) > 1 {
 		effectiveConfig.Users = authUsersToConfig(authUsers)
@@ -738,7 +738,7 @@ func main() {
 	if pflag.CommandLine.Changed("readonly") {
 		markCLI("readonly")
 	}
-	if pflag.CommandLine.Changed("advertise") || pflag.CommandLine.Changed("no-advertise") {
+	if pflag.CommandLine.Changed("no-advertise") {
 		markCLI("advertise")
 	}
 	if pflag.CommandLine.Changed("verbose") {
@@ -801,7 +801,7 @@ func main() {
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *advertise, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, advertiseEnabled, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
@@ -1263,7 +1263,7 @@ func main() {
 
 	// Optional Bonjour/mDNS + WS-Discovery advertisement for discovery.
 	var discovery *discoveryAdvertiser
-	if *advertise {
+	if advertiseEnabled {
 		discovery, err = startSMBAdvertiser(shares, listenEndpoints, listenPort, authUsers, *allowAddrs)
 		if err != nil {
 			logrus.Warnf("advertise disabled: %v", err)
@@ -1571,7 +1571,6 @@ func printUsage() {
 	printOpt("-n, --name", "Share name or name:path "+Dim("(repeatable)"))
 	printOpt("-l, --listen", "Address or @interface to listen on "+Dim("(repeatable, default: 0.0.0.0:445)"))
 	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
-	printOpt("    --advertise", "Advertise shares via "+Dim("mDNS (_smb._tcp) + WS-Discovery (default: on)"))
 	printOpt("    --no-advertise", "Disable share advertisement")
 	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-u, --username", "Require authentication "+Dim("(user or user:password, repeatable)"))
@@ -1670,7 +1669,7 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	if pflag.CommandLine.Changed("allow") {
 		writeStringArray("allow", allowAddrs)
 	}
-	if pflag.CommandLine.Changed("advertise") || pflag.CommandLine.Changed("no-advertise") {
+	if pflag.CommandLine.Changed("no-advertise") {
 		writeBool("advertise", advertise)
 	}
 	if pflag.CommandLine.Changed("verbose") {

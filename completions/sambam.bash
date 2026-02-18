@@ -7,7 +7,7 @@ _sambam_complete()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-    local global_flags="--name --listen --allow --advertise --no-advertise --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
+    local global_flags="--name --listen --allow --no-advertise --readonly --daemon --pidfile --logfile --config --verbose --hide-dotfiles --username --password --expire --gen-config --version --help"
     local subcmd_flags="--pidfile --help"
     local cmds="stop status"
     local _path_candidates
