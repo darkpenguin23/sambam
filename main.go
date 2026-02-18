@@ -28,27 +28,54 @@ import (
 
 // Share represents a named share with its path
 type Share struct {
-	Name string
-	Path string
+	Name       string
+	Path       string
+	ReadOnly   bool
+	Guest      bool
+	AllowUsers []string
+	Legacy     bool
+}
+
+type ShareConfig struct {
+	Path       string   `toml:"path"`
+	Readonly   bool     `toml:"readonly"`
+	Guest      bool     `toml:"guest"`
+	AllowUsers []string `toml:"allow_users"`
+}
+
+type shareFieldMask struct {
+	Path       bool
+	Readonly   bool
+	Guest      bool
+	AllowUsers bool
+	Legacy     bool
+}
+
+type UserConfig struct {
+	Name     string `toml:"name"`
+	Password string `toml:"password"`
+	Readonly bool   `toml:"readonly"`
 }
 
 // Config represents sambam configuration values loaded from rc files.
 type Config struct {
-	Listen       string            `toml:"listen"`
-	ListenAddrs  []string          `toml:"listen_addrs"`
-	Readonly     bool              `toml:"readonly"`
-	Verbose      bool              `toml:"verbose"`
-	VerboseLevel int               `toml:"verbose_level"`
-	Debug        bool              `toml:"debug"` // backward compatibility: maps to verbose_level=3
-	Trace        bool              `toml:"trace"`
-	Allow        []string          `toml:"allow"`
-	HideDotfiles bool              `toml:"hide_dotfiles"`
-	Username     string            `toml:"username"`
-	Password     string            `toml:"password"`
-	Expire       string            `toml:"expire"`
-	PidFile      string            `toml:"pidfile"`
-	LogFile      string            `toml:"logfile"`
-	Shares       map[string]string `toml:"shares"`
+	Listen       string       `toml:"listen"`
+	ListenAddrs  []string     `toml:"listen_addrs"`
+	Readonly     bool         `toml:"readonly"`
+	Verbose      bool         `toml:"verbose"`
+	VerboseLevel int          `toml:"verbose_level"`
+	Debug        bool         `toml:"debug"` // backward compatibility: maps to verbose_level=3
+	Trace        bool         `toml:"trace"`
+	Allow        []string     `toml:"allow"`
+	HideDotfiles bool         `toml:"hide_dotfiles"`
+	Username     string       `toml:"username"`
+	Password     string       `toml:"password"`
+	Users        []UserConfig `toml:"users"`
+	Expire       string       `toml:"expire"`
+	PidFile      string       `toml:"pidfile"`
+	LogFile      string       `toml:"logfile"`
+	Shares       map[string]ShareConfig
+	shareMask    map[string]shareFieldMask
 }
 
 type ConfigLoadInfo struct {
@@ -64,12 +91,84 @@ type ConfigLoadInfo struct {
 }
 
 func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
-	var config Config
-	md, err := toml.DecodeFile(path, &config)
+	type rawConfig struct {
+		Listen       string                    `toml:"listen"`
+		ListenAddrs  []string                  `toml:"listen_addrs"`
+		Readonly     bool                      `toml:"readonly"`
+		Verbose      bool                      `toml:"verbose"`
+		VerboseLevel int                       `toml:"verbose_level"`
+		Debug        bool                      `toml:"debug"`
+		Trace        bool                      `toml:"trace"`
+		Allow        []string                  `toml:"allow"`
+		HideDotfiles bool                      `toml:"hide_dotfiles"`
+		Username     string                    `toml:"username"`
+		Password     string                    `toml:"password"`
+		Users        []UserConfig              `toml:"users"`
+		Expire       string                    `toml:"expire"`
+		PidFile      string                    `toml:"pidfile"`
+		LogFile      string                    `toml:"logfile"`
+		Shares       map[string]toml.Primitive `toml:"shares"`
+	}
+
+	var raw rawConfig
+	md, err := toml.DecodeFile(path, &raw)
 	if err != nil {
 		return nil, md, err
 	}
-	return &config, md, nil
+	cfg := &Config{
+		Listen:       raw.Listen,
+		ListenAddrs:  append([]string(nil), raw.ListenAddrs...),
+		Readonly:     raw.Readonly,
+		Verbose:      raw.Verbose,
+		VerboseLevel: raw.VerboseLevel,
+		Debug:        raw.Debug,
+		Trace:        raw.Trace,
+		Allow:        append([]string(nil), raw.Allow...),
+		HideDotfiles: raw.HideDotfiles,
+		Username:     raw.Username,
+		Password:     raw.Password,
+		Users:        append([]UserConfig(nil), raw.Users...),
+		Expire:       raw.Expire,
+		PidFile:      raw.PidFile,
+		LogFile:      raw.LogFile,
+		Shares:       map[string]ShareConfig{},
+		shareMask:    map[string]shareFieldMask{},
+	}
+
+	for name, prim := range raw.Shares {
+		var pathOnly string
+		if err := md.PrimitiveDecode(prim, &pathOnly); err == nil {
+			cfg.Shares[name] = ShareConfig{Path: pathOnly}
+			cfg.shareMask[name] = shareFieldMask{Path: true, Legacy: true}
+			continue
+		}
+		var rawShare map[string]interface{}
+		if err := md.PrimitiveDecode(prim, &rawShare); err != nil {
+			return nil, md, fmt.Errorf("invalid shares.%s: expected string path or table", name)
+		}
+		var share ShareConfig
+		if err := md.PrimitiveDecode(prim, &share); err != nil {
+			return nil, md, fmt.Errorf("invalid shares.%s: expected string path or table", name)
+		}
+		cfg.Shares[name] = share
+		mask := shareFieldMask{}
+		if _, ok := rawShare["path"]; ok {
+			mask.Path = true
+		}
+		if _, ok := rawShare["readonly"]; ok {
+			mask.Readonly = true
+		}
+		if _, ok := rawShare["guest"]; ok {
+			mask.Guest = true
+		}
+		if _, ok := rawShare["allow_users"]; ok {
+			mask.AllowUsers = true
+		}
+		mask.Legacy = false
+		cfg.shareMask[name] = mask
+	}
+
+	return cfg, md, nil
 }
 
 func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
@@ -106,6 +205,9 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	if md.IsDefined("password") {
 		dst.Password = src.Password
 	}
+	if md.IsDefined("users") {
+		dst.Users = append([]UserConfig(nil), src.Users...)
+	}
 	if md.IsDefined("expire") {
 		dst.Expire = src.Expire
 	}
@@ -117,10 +219,34 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	}
 	if md.IsDefined("shares") {
 		if dst.Shares == nil {
-			dst.Shares = map[string]string{}
+			dst.Shares = map[string]ShareConfig{}
 		}
-		for name, path := range src.Shares {
-			dst.Shares[name] = path
+		if dst.shareMask == nil {
+			dst.shareMask = map[string]shareFieldMask{}
+		}
+		for name, share := range src.Shares {
+			mask := src.shareMask[name]
+			cur := dst.Shares[name]
+			dstMask := dst.shareMask[name]
+			if mask.Path {
+				cur.Path = share.Path
+				dstMask.Legacy = mask.Legacy
+			}
+			if mask.Readonly {
+				cur.Readonly = share.Readonly
+			}
+			if mask.Guest {
+				cur.Guest = share.Guest
+			}
+			if mask.AllowUsers {
+				cur.AllowUsers = append([]string(nil), share.AllowUsers...)
+			}
+			dst.Shares[name] = cur
+			dstMask.Path = dstMask.Path || mask.Path
+			dstMask.Readonly = dstMask.Readonly || mask.Readonly
+			dstMask.Guest = dstMask.Guest || mask.Guest
+			dstMask.AllowUsers = dstMask.AllowUsers || mask.AllowUsers
+			dst.shareMask[name] = dstMask
 		}
 	}
 }
@@ -162,6 +288,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("password") {
 		record("password")
 	}
+	if md.IsDefined("users") {
+		record("users")
+	}
 	if md.IsDefined("expire") {
 		record("expire")
 	}
@@ -174,7 +303,19 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("shares") {
 		record("shares")
 		for name := range cfg.Shares {
-			record("shares." + name)
+			mask := cfg.shareMask[name]
+			if mask.Path {
+				record("shares." + name + ".path")
+			}
+			if mask.AllowUsers {
+				record("shares." + name + ".allow_users")
+			}
+			if mask.Guest {
+				record("shares." + name + ".guest")
+			}
+			if mask.Readonly {
+				record("shares." + name + ".readonly")
+			}
 		}
 	}
 }
@@ -209,6 +350,8 @@ func configValueString(cfg *Config, key string) string {
 			return ""
 		}
 		return "<set>"
+	case "users":
+		return strconv.Itoa(len(cfg.Users))
 	case "expire":
 		return cfg.Expire
 	case "pidfile":
@@ -219,18 +362,36 @@ func configValueString(cfg *Config, key string) string {
 		return strconv.Itoa(len(cfg.Shares))
 	default:
 		if strings.HasPrefix(key, "shares.") {
-			name := strings.TrimPrefix(key, "shares.")
+			rest := strings.TrimPrefix(key, "shares.")
+			name := rest
+			field := ""
+			if i := strings.Index(rest, "."); i >= 0 {
+				name = rest[:i]
+				field = rest[i+1:]
+			}
 			if cfg.Shares == nil {
 				return ""
 			}
-			return cfg.Shares[name]
+			share := cfg.Shares[name]
+			switch field {
+			case "", "path":
+				return share.Path
+			case "readonly":
+				return strconv.FormatBool(share.Readonly)
+			case "guest":
+				return strconv.FormatBool(share.Guest)
+			case "allow_users":
+				return strings.Join(share.AllowUsers, ",")
+			}
+			return share.Path
 		}
 	}
 	return "<unknown>"
 }
 
-// loadConfig loads configuration in order:
-// /etc/sambamrc -> ~/.sambamrc -> ./.sambamrc -> custom files (-c, repeatable)
+// loadConfig loads configuration.
+// Default mode: /etc/sambamrc -> ~/.sambamrc -> ./.sambamrc
+// Explicit mode (-c): only custom files, in the order passed.
 func loadConfig(customPaths []string) (*Config, ConfigLoadInfo, error) {
 	var merged Config
 	hasConfig := false
@@ -271,33 +432,33 @@ func loadConfig(customPaths []string) (*Config, ConfigLoadInfo, error) {
 		return nil
 	}
 
-	// Base: system config.
-	_ = loadLayer(info.SystemPath, "system", false, func() {
-		info.SystemLoaded = true
-	})
-
-	// Overlay: user config.
-	home, err := os.UserHomeDir()
-	if err == nil {
-		configPath := filepath.Join(home, ".sambamrc")
-		info.HomePath = configPath
-		_ = loadLayer(configPath, "home", false, func() { info.HomeLoaded = true })
-	}
-
-	// Overlay: project-local config.
-	_ = loadLayer(info.LocalPath, "local", false, func() { info.LocalLoaded = true })
-
-	// Overlay: explicit custom config files (repeatable, required to exist).
-	for _, p := range customPaths {
-		path := p
-		if !filepath.IsAbs(path) {
-			path = filepath.Clean(path)
+	if len(customPaths) > 0 {
+		// Explicit config mode: only load -c files.
+		for _, p := range customPaths {
+			path := p
+			if !filepath.IsAbs(path) {
+				path = filepath.Clean(path)
+			}
+			if err := loadLayer(path, "custom:"+path, true, func() {
+				info.CustomLoaded = append(info.CustomLoaded, path)
+			}); err != nil {
+				return nil, info, err
+			}
 		}
-		if err := loadLayer(path, "custom:"+path, true, func() {
-			info.CustomLoaded = append(info.CustomLoaded, path)
-		}); err != nil {
-			return nil, info, err
+	} else {
+		// Default discovery mode.
+		_ = loadLayer(info.SystemPath, "system", false, func() {
+			info.SystemLoaded = true
+		})
+
+		home, err := os.UserHomeDir()
+		if err == nil {
+			configPath := filepath.Join(home, ".sambamrc")
+			info.HomePath = configPath
+			_ = loadLayer(configPath, "home", false, func() { info.HomeLoaded = true })
 		}
+
+		_ = loadLayer(info.LocalPath, "local", false, func() { info.LocalLoaded = true })
 	}
 
 	if !hasConfig {
@@ -315,8 +476,14 @@ type logFormatter struct {
 
 func (f *logFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	ts := Dim(entry.Time.Format("15:04:05"))
+	clientTag := ""
+	if c, ok := entry.Data["client"]; ok {
+		if s, ok := c.(string); ok && s != "" {
+			clientTag = Dim(" [" + s + "]")
+		}
+	}
 	if !f.showLevel {
-		return []byte(fmt.Sprintf("  %s %s\n", ts, entry.Message)), nil
+		return []byte(fmt.Sprintf("  %s%s %s\n", ts, clientTag, entry.Message)), nil
 	}
 
 	level := strings.ToUpper(entry.Level.String())
@@ -334,7 +501,7 @@ func (f *logFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 		levelTag = Red("[ERR]")
 	}
 
-	return []byte(fmt.Sprintf("  %s %s %s\n", ts, levelTag, entry.Message)), nil
+	return []byte(fmt.Sprintf("  %s%s %s %s\n", ts, clientTag, levelTag, entry.Message)), nil
 }
 
 // generatePassword creates a random alphanumeric password
@@ -372,7 +539,7 @@ func main() {
 	pidFile := pflag.StringP("pidfile", "P", "/tmp/sambam.pid", "PID file location (daemon mode)")
 	logFile := pflag.StringP("logfile", "L", "", "Log file path (default /tmp/sambam.log when value is omitted)")
 	pflag.Lookup("logfile").NoOptDefVal = "/tmp/sambam.log"
-	configFiles := pflag.StringArrayP("config", "c", []string{}, "Additional config file (repeatable, applied after defaults)")
+	configFiles := pflag.StringArrayP("config", "c", []string{}, "Config file (repeatable, disables default config discovery)")
 
 	// Verbosity flags
 	verbose := pflag.CountP("verbose", "v", "Show connections and file activity (-vv extended, -vvv full trace)")
@@ -381,7 +548,7 @@ func main() {
 	hideDotfiles := pflag.BoolP("hide-dotfiles", "H", false, "Hide files starting with '.'")
 
 	// Authentication flags
-	username := pflag.StringP("username", "u", "", "Require authentication with this username")
+	userSpecs := pflag.StringArrayP("username", "u", []string{}, "Require authentication (user or user:password, repeatable)")
 	password := pflag.StringP("password", "p", "", "Password for authentication (random if not specified)")
 
 	// Auto-expire flag
@@ -424,7 +591,7 @@ func main() {
 			*allowAddrs = append([]string(nil), config.Allow...)
 		}
 		if !pflag.CommandLine.Changed("username") && config.Username != "" {
-			*username = config.Username
+			*userSpecs = []string{config.Username}
 		}
 		if !pflag.CommandLine.Changed("password") && config.Password != "" {
 			*password = config.Password
@@ -443,13 +610,17 @@ func main() {
 		}
 	}
 
-	// Password requires username (applies to normal run and config generation).
-	if *password != "" && *username == "" {
-		fmt.Fprintln(os.Stderr, "Error: password requires username. Use -u/--username together with -p/--password.")
-		os.Exit(1)
-	}
 	if len(*listenAddrs) == 0 {
 		*listenAddrs = []string{"0.0.0.0:445"}
+	}
+	authUsers, err := buildAuthUsers(*userSpecs, *password, pflag.CommandLine.Changed("username"), pflag.CommandLine.Changed("password"), config)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	legacyAuthUser := ""
+	if config != nil && !pflag.CommandLine.Changed("username") && !pflag.CommandLine.Changed("password") {
+		legacyAuthUser = strings.TrimSpace(config.Username)
 	}
 	allowNets, err := parseAllowedNetworks(*allowAddrs)
 	if err != nil {
@@ -465,7 +636,7 @@ func main() {
 			effectiveConfig.Allow = append([]string(nil), config.Allow...)
 		}
 		if config.Shares != nil {
-			effectiveConfig.Shares = make(map[string]string, len(config.Shares))
+			effectiveConfig.Shares = make(map[string]ShareConfig, len(config.Shares))
 			for k, v := range config.Shares {
 				effectiveConfig.Shares[k] = v
 			}
@@ -480,8 +651,21 @@ func main() {
 	}
 	effectiveConfig.Readonly = *readOnly
 	effectiveConfig.HideDotfiles = *hideDotfiles
-	effectiveConfig.Username = *username
-	effectiveConfig.Password = *password
+	if len(authUsers) == 1 {
+		for _, u := range authUsers {
+			effectiveConfig.Username = u.Name
+			effectiveConfig.Password = u.Password
+		}
+		effectiveConfig.Users = nil
+	} else if len(authUsers) > 1 {
+		effectiveConfig.Username = ""
+		effectiveConfig.Password = ""
+		effectiveConfig.Users = authUsersToConfig(authUsers)
+	} else {
+		effectiveConfig.Username = ""
+		effectiveConfig.Password = ""
+		effectiveConfig.Users = nil
+	}
 	effectiveConfig.Expire = *expireStr
 	effectiveConfig.PidFile = *pidFile
 	effectiveConfig.LogFile = *logFile
@@ -531,6 +715,9 @@ func main() {
 	}
 	if pflag.CommandLine.Changed("username") {
 		markCLI("username")
+		if len(*userSpecs) > 1 {
+			markCLI("users")
+		}
 	}
 	if pflag.CommandLine.Changed("password") {
 		markCLI("password")
@@ -573,7 +760,7 @@ func main() {
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *username, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
@@ -624,10 +811,6 @@ func main() {
 
 	extraVerbose := *verbose >= 2
 	fullVerbose := *verbose >= 3
-	actualPassword := *password
-	if *username != "" && actualPassword == "" {
-		actualPassword = generatePassword(10)
-	}
 
 	if *showHelp {
 		printUsage()
@@ -640,6 +823,7 @@ func main() {
 	}
 
 	configLogsPrinted := false
+	configMergeLogs := []string{}
 	printConfigLogs := func() {
 		if configLogsPrinted || *verbose <= 0 {
 			return
@@ -676,6 +860,22 @@ func main() {
 				logrus.Debug(msg)
 			}
 		}
+		if *verbose >= 2 && len(configMergeLogs) > 0 {
+			for _, msg := range configMergeLogs {
+				logrus.Debug(msg)
+			}
+		}
+		if *verbose >= 2 && config != nil && len(config.Users) > 0 && strings.TrimSpace(config.Username) != "" && !pflag.CommandLine.Changed("username") && !pflag.CommandLine.Changed("password") {
+			userSrc := configInfo.SettingSrc["users"]
+			legacySrc := configInfo.SettingSrc["username"]
+			if userSrc == "" {
+				userSrc = "config"
+			}
+			if legacySrc == "" {
+				legacySrc = "config"
+			}
+			logrus.Debugf("config auth merge: users <- %s + legacy username=%q <- %s (total users=%d)", userSrc, config.Username, legacySrc, len(authUsers))
+		}
 	}
 
 	// Parse shares.
@@ -685,13 +885,24 @@ func main() {
 
 	// Base shares from config.
 	if config != nil && len(config.Shares) > 0 {
-		for name, path := range config.Shares {
-			absPath, err := filepath.Abs(path)
+		for name, sc := range config.Shares {
+			if strings.TrimSpace(sc.Path) == "" {
+				fmt.Fprintf(os.Stderr, "Error: shares.%s.path is required (set in one of the loaded config files)\n", name)
+				os.Exit(1)
+			}
+			absPath, err := filepath.Abs(sc.Path)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error resolving path for '%s': %v\n", name, err)
 				os.Exit(1)
 			}
-			shareMap[name] = Share{Name: name, Path: absPath}
+			shareMap[name] = Share{
+				Name:       name,
+				Path:       absPath,
+				ReadOnly:   sc.Readonly || *readOnly,
+				Guest:      sc.Guest,
+				AllowUsers: append([]string(nil), sc.AllowUsers...),
+				Legacy:     config.shareMask[name].Legacy,
+			}
 		}
 	}
 
@@ -703,7 +914,14 @@ func main() {
 			os.Exit(1)
 		}
 		name := shareName(absPath)
-		shareMap[name] = Share{Name: name, Path: absPath}
+		s := Share{Name: name, Path: absPath, ReadOnly: *readOnly}
+		if prev, ok := shareMap[name]; ok {
+			s.Guest = prev.Guest
+			s.AllowUsers = append([]string(nil), prev.AllowUsers...)
+			s.ReadOnly = prev.ReadOnly || *readOnly
+			s.Legacy = prev.Legacy
+		}
+		shareMap[name] = s
 	} else if len(*shareSpecs) > 0 {
 		for _, spec := range *shareSpecs {
 			var name, path string
@@ -724,7 +942,14 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error resolving path for '%s': %v\n", name, err)
 				os.Exit(1)
 			}
-			shareMap[name] = Share{Name: name, Path: absPath}
+			s := Share{Name: name, Path: absPath, ReadOnly: *readOnly}
+			if prev, ok := shareMap[name]; ok {
+				s.Guest = prev.Guest
+				s.AllowUsers = append([]string(nil), prev.AllowUsers...)
+				s.ReadOnly = prev.ReadOnly || *readOnly
+				s.Legacy = prev.Legacy
+			}
+			shareMap[name] = s
 		}
 	}
 
@@ -736,7 +961,7 @@ func main() {
 			os.Exit(1)
 		}
 		name := shareName(absPath)
-		shareMap[name] = Share{Name: name, Path: absPath}
+		shareMap[name] = Share{Name: name, Path: absPath, ReadOnly: *readOnly}
 	}
 
 	var shares []Share
@@ -835,7 +1060,7 @@ func main() {
 		if child != nil {
 			// Parent process
 			// Show connection details even in daemon mode.
-			printBanner(shares, *readOnly, listenDisplay, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true, extraVerbose)
+			printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, true, extraVerbose)
 			printConfigLogs()
 
 			fmt.Println()
@@ -868,7 +1093,7 @@ func main() {
 	// Create filesystems for all shares
 	vfsShares := make(map[string]vfs.VFSFileSystem)
 	for _, share := range shares {
-		fs := NewPassthroughFS(share.Path, *readOnly)
+		fs := NewPassthroughFS(share.Path, share.ReadOnly)
 
 		// Setup filesystem callbacks for verbose mode
 		if *verbose > 0 {
@@ -952,19 +1177,51 @@ func main() {
 
 	// Setup authentication
 	userPassword := map[string]string{}
-	allowGuest := true
-
-	if *username != "" {
-		allowGuest = false
-		userPassword[*username] = actualPassword
+	userReadonly := map[string]bool{}
+	allowGuest := len(authUsers) == 0
+	for _, au := range authUsers {
+		userPassword[au.Name] = au.Password
+		userReadonly[strings.ToLower(au.Name)] = au.Readonly
+	}
+	authUserNames := make([]string, 0, len(authUsers))
+	for _, au := range authUsers {
+		authUserNames = append(authUserNames, au.Name)
+	}
+	shareAllowUsers := map[string][]string{}
+	shareGuest := map[string]bool{}
+	guestShareExists := false
+	for _, share := range shares {
+		if share.Guest {
+			shareGuest[share.Name] = true
+			guestShareExists = true
+		} else if len(share.AllowUsers) == 0 && share.Legacy {
+			if legacyAuthUser != "" {
+				shareAllowUsers[share.Name] = []string{legacyAuthUser}
+				configMergeLogs = append(configMergeLogs, fmt.Sprintf("config merge: shares.%s legacy -> allow_users=%q (from legacy username)", share.Name, legacyAuthUser))
+			} else {
+				shareGuest[share.Name] = true
+				guestShareExists = true
+				configMergeLogs = append(configMergeLogs, fmt.Sprintf("config merge: shares.%s legacy -> guest=true (no legacy username/password)", share.Name))
+			}
+		}
+		if len(share.AllowUsers) > 0 {
+			shareAllowUsers[share.Name] = append([]string(nil), share.AllowUsers...)
+		}
+	}
+	if guestShareExists {
+		allowGuest = true
 	}
 
 	// Create server
 	srv := smb2.NewServer(
 		&smb2.ServerConfig{
-			AllowGuest:   allowGuest,
-			Xatrrs:       true,
-			HideDotfiles: *hideDotfiles,
+			AllowGuest:      allowGuest,
+			Xatrrs:          true,
+			HideDotfiles:    *hideDotfiles,
+			ShareGuest:      shareGuest,
+			ShareAllowUsers: shareAllowUsers,
+			AuthUsers:       authUserNames,
+			UserReadonly:    userReadonly,
 			AllowConn: func(remoteAddr string) bool {
 				return isRemoteAllowed(remoteAddr, allowNets)
 			},
@@ -990,7 +1247,7 @@ func main() {
 
 	// Print banner in foreground mode.
 	if !*daemonMode {
-		printBanner(shares, *readOnly, listenDisplay, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false, extraVerbose)
+		printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, false, extraVerbose)
 		printConfigLogs()
 	}
 
@@ -1108,7 +1365,7 @@ func normalizeLogPath(path string) string {
 	return path
 }
 
-func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, username string, password string, expireStr string, daemonMode bool, extendedConnect bool) {
+func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, authText string, authMount string, expireStr string, daemonMode bool, extendedConnect bool) {
 	fmt.Println()
 	fmt.Printf("  %s %s\n", CyanBold("sambam v"+version), Dim("(built with AI assistance)"))
 	fmt.Println()
@@ -1142,19 +1399,21 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	}
 	fmt.Printf("  %-12s %s\n", "Listen", listenColored)
 
-	modeStr := "read-write"
-	if readOnly {
+	modeStr := Red("read-write")
+	roCount := 0
+	for _, s := range shares {
+		if s.ReadOnly {
+			roCount++
+		}
+	}
+	if roCount == len(shares) {
 		modeStr = Green("read-only")
-	} else {
-		modeStr = Red("read-write")
+	} else if roCount > 0 {
+		modeStr = Yellow("mixed")
 	}
 	fmt.Printf("  %-12s %s\n", "Mode", modeStr)
 
-	if username != "" {
-		fmt.Printf("  %-12s %s\n", "Auth", Yellow(username)+Dim(":")+Yellow(password))
-	} else {
-		fmt.Printf("  %-12s %s\n", "Auth", Dim("anonymous"))
-	}
+	fmt.Printf("  %-12s %s\n", "Auth", authText)
 	allowText := "all"
 	allowTextColored := Dim("all")
 	if len(allowAddrs) > 0 {
@@ -1175,10 +1434,7 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	comboCount := len(displayIPs) * len(shares)
 
 	fmt.Println()
-	authOpt := "guest"
-	if username != "" {
-		authOpt = "username=" + username + ",password=" + password
-	}
+	authOpt := authMount
 	portOpt := ""
 	if nonStdPort {
 		portOpt = ",port=" + portNum
@@ -1307,7 +1563,7 @@ func printUsage() {
 	printOpt("-l, --listen", "Address or @interface to listen on "+Dim("(repeatable, default: 0.0.0.0:445)"))
 	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
 	printOpt("-r, --readonly", "Make share read-only")
-	printOpt("-u, --username", "Require authentication")
+	printOpt("-u, --username", "Require authentication "+Dim("(user or user:password, repeatable)"))
 	printOpt("-p, --password", "Password "+Dim("(random if not set)"))
 	printOpt("-e, --expire", "Auto-shutdown after duration "+Dim("(e.g., 30m, 1h)"))
 	printOpt("-v, --verbose", "Show connections and file activity "+Dim("(-vv extended, -vvv full trace)"))
@@ -1315,7 +1571,7 @@ func printUsage() {
 	printOpt("-d, --daemon", "Run as background daemon")
 	printOpt("-P, --pidfile", "PID file location "+Dim("(default: /tmp/sambam.pid)"))
 	printOpt("-L, --logfile", "Log file path "+Dim("(default /tmp/sambam.log when omitted)"))
-	printOpt("-c, --config", "Additional config file "+Dim("(repeatable, applied last)"))
+	printOpt("-c, --config", "Config file "+Dim("(repeatable, disables default config discovery)"))
 	printOpt("-G, --gen-config", "Generate config TOML and exit "+Dim("(default: ./.sambamrc)"))
 	printOpt("-V, --version", "Show version")
 	printOpt("-h, --help", "Show help")
@@ -1344,6 +1600,9 @@ func normalizeCLIArgs(args []string) []string {
 				out = append(out, "--logfile=/tmp/sambam.log")
 				continue
 			}
+			out = append(out, "--logfile="+args[i+1])
+			i++
+			continue
 		}
 		if (arg == "-G" || arg == "--gen-config" || arg == "--generate-config") && i+1 < len(args) {
 			next := args[i+1]
@@ -1358,7 +1617,7 @@ func normalizeCLIArgs(args []string) []string {
 	return out
 }
 
-func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, username, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
+func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, userSpecs []string, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
 	var b bytes.Buffer
 	written := []string{}
 	b.WriteString("# sambam generated configuration\n")
@@ -1411,10 +1670,30 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 		writeBool("hide_dotfiles", hideDotfiles)
 	}
 	if pflag.CommandLine.Changed("username") {
-		writeString("username", username)
-	}
-	if pflag.CommandLine.Changed("password") {
-		writeString("password", password)
+		users, err := buildAuthUsers(userSpecs, password, true, pflag.CommandLine.Changed("password"), nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(users) == 1 && !users[0].Readonly {
+			writeString("username", users[0].Name)
+			writeString("password", users[0].Password)
+		} else if len(users) > 1 || (len(users) == 1 && users[0].Readonly) {
+			b.WriteString("\n")
+			for i, u := range users {
+				b.WriteString("[[users]]\n")
+				fmt.Fprintf(&b, "name = %s\n", strconv.Quote(u.Name))
+				fmt.Fprintf(&b, "password = %s\n", strconv.Quote(u.Password))
+				written = append(written, fmt.Sprintf("users[%d].name=%q", i, u.Name))
+				written = append(written, fmt.Sprintf("users[%d].password=%q", i, u.Password))
+				if u.Readonly {
+					b.WriteString("readonly = true\n")
+					written = append(written, fmt.Sprintf("users[%d].readonly=true", i))
+				}
+				b.WriteString("\n")
+			}
+		}
+	} else if pflag.CommandLine.Changed("password") {
+		return nil, fmt.Errorf("password requires username. Use -u/--username together with -p/--password")
 	}
 	if pflag.CommandLine.Changed("expire") {
 		writeString("expire", expire)
@@ -1513,6 +1792,12 @@ type listenEndpoint struct {
 	Wildcard bool
 }
 
+type authUser struct {
+	Name     string
+	Password string
+	Readonly bool
+}
+
 func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
 	endpoints := make([]listenEndpoint, 0, len(values))
 	seen := map[string]struct{}{}
@@ -1580,6 +1865,131 @@ func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
 		return nil, "", fmt.Errorf("no listen endpoints configured")
 	}
 	return endpoints, commonPort, nil
+}
+
+func buildAuthUsers(cliUsers []string, cliPassword string, cliUsersChanged bool, cliPasswordChanged bool, cfg *Config) ([]authUser, error) {
+	normalize := func(users []authUser) []authUser {
+		sort.Slice(users, func(i, j int) bool {
+			return strings.ToLower(users[i].Name) < strings.ToLower(users[j].Name)
+		})
+		return users
+	}
+
+	if cliUsersChanged || cliPasswordChanged {
+		if len(cliUsers) == 0 {
+			if cliPassword != "" {
+				return nil, fmt.Errorf("password requires username. Use -u/--username together with -p/--password")
+			}
+			return nil, nil
+		}
+		if len(cliUsers) > 1 && cliPassword != "" {
+			return nil, fmt.Errorf("-p/--password can only be used with a single -u value; use -u user:pass for multiple users")
+		}
+
+		users := make([]authUser, 0, len(cliUsers))
+		for _, raw := range cliUsers {
+			entry := strings.TrimSpace(raw)
+			if entry == "" {
+				return nil, fmt.Errorf("username cannot be empty")
+			}
+			name := entry
+			pass := ""
+			if strings.Contains(entry, ":") {
+				parts := strings.SplitN(entry, ":", 2)
+				name = strings.TrimSpace(parts[0])
+				pass = parts[1]
+				if name == "" || pass == "" {
+					return nil, fmt.Errorf("invalid -u value %q: expected user:password", raw)
+				}
+			}
+			users = append(users, authUser{Name: name, Password: pass})
+		}
+
+		if len(users) == 1 && users[0].Password == "" {
+			users[0].Password = cliPassword
+			if users[0].Password == "" {
+				users[0].Password = generatePassword(10)
+			}
+		}
+		for _, u := range users {
+			if u.Password == "" {
+				return nil, fmt.Errorf("missing password for user %q; use -u user:password", u.Name)
+			}
+		}
+		return normalize(users), nil
+	}
+
+	if cfg != nil {
+		byName := map[string]authUser{}
+		users := make([]authUser, 0, len(cfg.Users)+1)
+		for _, u := range cfg.Users {
+			name := strings.TrimSpace(u.Name)
+			if name == "" {
+				return nil, fmt.Errorf("config users entry has empty name")
+			}
+			if u.Password == "" {
+				return nil, fmt.Errorf("config user %q is missing password", name)
+			}
+			key := strings.ToLower(name)
+			byName[key] = authUser{Name: name, Password: u.Password, Readonly: u.Readonly}
+		}
+		if cfg.Username != "" {
+			pass := cfg.Password
+			if pass == "" {
+				pass = generatePassword(10)
+			}
+			key := strings.ToLower(strings.TrimSpace(cfg.Username))
+			if key != "" {
+				// Legacy username/password is additive with [[users]], preserving
+				// compatibility with generated configs layered with manual ones.
+				byName[key] = authUser{Name: strings.TrimSpace(cfg.Username), Password: pass}
+			}
+		}
+		for _, u := range byName {
+			users = append(users, u)
+		}
+		if len(users) > 0 {
+			return normalize(users), nil
+		}
+	}
+	return nil, nil
+}
+
+func authUsersToConfig(users []authUser) []UserConfig {
+	out := make([]UserConfig, 0, len(users))
+	for _, u := range users {
+		out = append(out, UserConfig{Name: u.Name, Password: u.Password, Readonly: u.Readonly})
+	}
+	return out
+}
+
+func authDisplay(users []authUser) string {
+	if len(users) == 0 {
+		return Dim("anonymous")
+	}
+	if len(users) == 1 {
+		return Yellow(users[0].Name) + Dim(":") + Yellow(users[0].Password)
+	}
+	ro := 0
+	for _, u := range users {
+		if u.Readonly {
+			ro++
+		}
+	}
+	if ro > 0 {
+		return Yellow(fmt.Sprintf("%d users (%d read-only)", len(users), ro))
+	}
+	return Yellow(fmt.Sprintf("%d users", len(users)))
+}
+
+func mountAuthOpt(users []authUser) string {
+	if len(users) == 0 {
+		return "guest"
+	}
+	if len(users) == 1 {
+		return "username=" + users[0].Name + ",password=" + users[0].Password
+	}
+	return "username=<user>,password=<pass>"
 }
 
 func resolveListenHost(host string) (resolvedHost string, iface string, err error) {

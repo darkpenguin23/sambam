@@ -32,9 +32,11 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **Zero configuration** - No config files, no setup wizards, no existential dread
 - **Anonymous access** - No passwords by default (or add authentication if needed)
 - **Optional authentication** - Require username/password when you need it
+- **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[[users]]` config
 - **Multiple shares** - Share multiple directories with different names
+- **Per-share access control** - `allow_users` and share-level `readonly` in config
 - **Auto-expire** - Automatically stop sharing after a set time
-- **Config file** - Layered config from `/etc/sambamrc`, `~/.sambamrc`, and `./.sambamrc`
+- **Config file** - Layered defaults, or explicit `-c` config-only mode
 - **Cross-platform clients** - Works with Windows 10/11, macOS, and Linux (CIFS mount)
 - **SMB 2.1 / 3.0 / 3.1.1** - Compatible with modern SMB protocol versions, including POSIX extensions
 - **Single binary** - Runs on any Linux distribution (Debian, Ubuntu, OpenWrt, etc.)
@@ -118,18 +120,62 @@ sambam -a 192.168.1.10 -a 192.168.2.0/24 /data
 
 Share in read-only mode. Clients can browse and copy files but cannot modify, delete, or upload.
 
-### `-u, --username <name>`
+### `-u, --username <user|user:password>`
 
-Require authentication. Clients must provide this username to access the share. When set, anonymous access is disabled. If `-p, --password` is not specified, a random password is generated and displayed in the banner.
+Require authentication. Repeatable.
+
+- Single-user quick mode: `-u admin -p secret` (or omit `-p` for random password)
+- Multi-user CLI mode: `-u alice:secret1 -u bob:secret2`
 
 ```bash
-sudo sambam --username admin /data
-sudo sambam --username admin --password secret123 /data
+sudo sambam -u admin /data
+sudo sambam -u admin -p secret123 /data
+sudo sambam -u alice:secret1 -u bob:secret2 /data
 ```
 
 ### `-p, --password <password>`
 
-Set a specific password for authentication. Only used together with `-u, --username`. If omitted, a random 10-character password is generated.
+Set a password for single-user CLI mode (`-u <user>`).  
+For multi-user CLI mode, use `-u <user:password>` for each user.
+
+### Authentication Tiers
+
+Tier 1 — quick share:
+
+```bash
+sambam /data
+sambam -u alice -p secret /data
+```
+
+Tier 2 — multiple users (same access for all):
+
+```bash
+sambam -u alice:secret1 -u bob:secret2 /data
+```
+
+Tier 3 — per-share permissions (config):
+
+```toml
+[[users]]
+name = "alice"
+password = "secret1"
+
+[[users]]
+name = "bob"
+password = "secret2"
+readonly = true
+
+[shares.media]
+path = "/mnt/media"
+
+[shares.private]
+path = "/home/user/private"
+allow_users = ["alice"]
+
+[shares.public]
+path = "/srv/public"
+guest = true
+```
 
 ### `-e, --expire <duration>`
 
@@ -179,9 +225,10 @@ If used without a value, defaults to `/tmp/sambam.log`.
 
 ### `-c, --config <path>`
 
-Load an additional config file. Repeatable.
+Load config file(s) explicitly. Repeatable.
 
-Custom config files are applied after `/etc/sambamrc`, `~/.sambamrc`, and `./.sambamrc`, in the order they are passed. CLI flags still have highest priority.
+When `-c` is used, default discovery (`/etc/sambamrc`, `~/.sambamrc`, `./.sambamrc`) is skipped.
+Files passed via `-c` are applied in order, and CLI flags still have highest priority.
 
 ```bash
 sambam -c /etc/sambam-prod.toml -c ./sambam.override.toml
@@ -214,77 +261,77 @@ Show help and exit.
 
 ## Configuration File
 
-sambam reads configuration in this order:
+sambam has two config loading modes:
 
-1. Base config: `/etc/sambamrc` (if present)
-2. User overrides: `~/.sambamrc` (if present)
-3. Local overrides: `./.sambamrc` (if present)
-4. Extra overrides: each `-c, --config <path>` in the order passed (required to exist)
+1. Default mode (no `-c`): `/etc/sambamrc` -> `~/.sambamrc` -> `./.sambamrc`
+2. Explicit mode (with `-c`): only the provided `-c, --config <path>` files, in order (required to exist)
 
-Local config overrides only the keys explicitly set in `./.sambamrc`.
-For `[shares]`, entries are merged by share name (later layers override same-name entries from earlier layers).
+CLI flags override all config values.
 
-Finally, CLI flags override config values.
+### Basic Config (Recommended)
 
-Example `/etc/sambamrc` + `~/.sambamrc` + `./.sambamrc` layering:
+Use the old-style format unless you need per-user/per-share controls.  
+It maps directly to CLI flags and is easy to generate with `-G`.
 
-```toml
-# /etc/sambamrc
-listen = "10.23.22.12:445"
-readonly = false
+```bash
+sambam -n docs:/data/docs -u admin -p secret -r -G
 ```
 
 ```toml
-# ~/.sambamrc
-listen = "10.23.22.13:445"
-```
-
-```toml
-# ./.sambamrc
-readonly = true
-```
-
-Result: `listen` comes from user config, `readonly` comes from local config.
-
-Example configuration file (TOML):
-
-```toml
-# Listen address (IP:port or @interface[:port])
 listen = "0.0.0.0:445"
-# listen = "@eth0:445"
-# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
+readonly = true
+username = "admin"
+password = "secret"
 
-# Allowlist clients (optional)
-# allow = ["192.168.1.10", "192.168.2.0/24"]
-
-# Read-only mode
-readonly = false
-
-# Show connections and file activity
-verbose = true
-# verbose_level = 2   # equivalent to -vv
-
-# verbose_level = 3   # equivalent to -vvv
-
-# Hide files starting with '.'
-# hide_dotfiles = true
-
-# Authentication
-# username = "admin"
-# password = "secret123"
-
-# Auto-expire
-# expire = "1h"
-
-# Daemon mode settings
-# pidfile = "/tmp/sambam.pid"
-# logfile = "/var/log/sambam.log"
-
-# Multiple shares
 [shares]
-docs = "/home/user/documents"
-pics = "/home/user/photos"
+docs = "/data/docs"
 ```
+
+Why recommended:
+- follows CLI behavior
+- easiest to read and maintain
+- can be generated quickly with `-G`
+
+### Advanced Config
+
+Use this when you need multiple users, per-user readonly, or per-share access rules.
+
+```toml
+[[users]]
+name = "alice"
+password = "secret1"
+
+[[users]]
+name = "bob"
+password = "secret2"
+readonly = true
+
+[shares.media]
+path = "/mnt/media"
+guest = true
+
+[shares.private]
+path = "/home/user/private"
+readonly = true
+allow_users = ["alice"]
+```
+
+Notes:
+- `guest = true` allows anonymous/guest access for that share.
+- `allow_users` restricts a share to specific users.
+- advanced share entries use `[shares.<name>]`.
+
+### Mixing Basic + Advanced
+
+Mixing works, but is not recommended unless you know why you need it.
+
+Mix rules:
+- legacy share entries from `[shares]` can be overlaid by `[shares.<name>]` in later config files
+- legacy share without explicit advanced rule uses legacy auth mapping
+- with legacy `username/password`, it is treated as `allow_users=["<legacy-user>"]`
+- without legacy `username/password`, it is treated as guest-accessible
+
+Use `-vv` to see effective settings and merge decisions in logs.
 
 See `sambamrc.example` for a full example.
 

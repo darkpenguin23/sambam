@@ -22,9 +22,19 @@ verbose = true
 # Hide files starting with '.'
 # hide_dotfiles = true
 
-# Authentication (optional)
+# Authentication (single-user legacy style)
 # username = "admin"
 # password = "secret123"
+
+# Authentication (multi-user style)
+# [[users]]
+# name = "alice"
+# password = "secret1"
+#
+# [[users]]
+# name = "bob"
+# password = "secret2"
+# readonly = true
 
 # Auto-expire (optional, e.g. 30m, 1h, 2h30m)
 # expire = "30m"
@@ -33,7 +43,20 @@ verbose = true
 # pidfile = "/tmp/sambam.pid"
 # logfile = "/var/log/sambam.log"
 
-# Shares - map of share_name = "/path/to/folder"
-[shares]
-docs = "/tmp/docs"
-pics = "/tmp/pics"
+# Shares - legacy shorthand
+# [shares]
+# docs = "/tmp/docs"
+# pics = "/tmp/pics"
+
+# Shares - per-share controls
+[shares.docs]
+path = "/tmp/docs"
+
+[shares.private]
+path = "/tmp/private"
+readonly = true
+# allow_users = ["alice"]
+
+[shares.public]
+path = "/tmp/public"
+guest = true

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	. "github.com/sambam/sambam/smb/internal/erref"
+	"github.com/sambam/sambam/smb/internal/ntlm"
 	. "github.com/sambam/sambam/smb/internal/smb2"
 	log "github.com/sirupsen/logrus"
 )
@@ -97,8 +98,13 @@ func (r *outstandingRequests) shutdown(err error) {
 }
 
 type conn struct {
-	t          transport
-	remoteAddr string
+	t             transport
+	remoteAddr    string
+	clientHost    string
+	clientOS      string
+	clientOSSrc   string
+	clientOSPrio  int
+	profileLogged bool
 
 	session                   *session
 	sessions                  map[uint64]*session
@@ -148,11 +154,133 @@ type conn struct {
 	treeMapById   map[uint32]treeOps
 }
 
+const (
+	clientOSPrioDefault = 10
+	clientOSPrioNTLM    = 20
+	clientOSPrioPOSIX   = 80
+	clientOSPrioAAPL    = 90
+)
+
+func (c *conn) logger() *log.Entry {
+	return log.WithField("client", c.remoteAddr)
+}
+
+func (c *conn) tracef(format string, args ...interface{}) {
+	c.logger().Tracef(format, args...)
+}
+
+func (c *conn) debugf(format string, args ...interface{}) {
+	c.logger().Debugf(format, args...)
+}
+
+func (c *conn) infof(format string, args ...interface{}) {
+	c.logger().Infof(format, args...)
+}
+
+func (c *conn) warnf(format string, args ...interface{}) {
+	c.logger().Warnf(format, args...)
+}
+
+func (c *conn) errorf(format string, args ...interface{}) {
+	c.logger().Errorf(format, args...)
+}
+
+func (c *conn) setClientOS(osName, source string, priority int) {
+	if strings.TrimSpace(osName) == "" {
+		return
+	}
+	c.m.Lock()
+	changed := false
+	if priority >= c.clientOSPrio && (c.clientOS != osName || c.clientOSSrc != source) {
+		c.clientOS = osName
+		c.clientOSSrc = source
+		c.clientOSPrio = priority
+		changed = true
+	}
+	profileLogged := c.profileLogged
+	c.m.Unlock()
+
+	if changed && profileLogged {
+		c.infof("client os updated: %s (%s)", osName, source)
+	}
+}
+
+func (c *conn) setClientHost(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return
+	}
+	c.m.Lock()
+	if c.clientHost == "" {
+		c.clientHost = name
+	}
+	c.m.Unlock()
+}
+
+func (c *conn) observeNTLMInfo(info *ntlm.InfoMap) {
+	if info == nil {
+		return
+	}
+	if info.NbComputerName != "" {
+		c.setClientHost(info.NbComputerName)
+	} else if info.DnsComputerName != "" {
+		c.setClientHost(info.DnsComputerName)
+	}
+
+	blob := strings.ToLower(strings.Join([]string{
+		info.NbComputerName,
+		info.NbDomainName,
+		info.DnsComputerName,
+		info.DnsDomainName,
+		info.DnsTreeName,
+	}, " "))
+
+	switch {
+	case strings.Contains(blob, "mac") || strings.Contains(blob, "darwin"):
+		c.setClientOS("macOS", "ntlm metadata heuristic", clientOSPrioNTLM)
+	case strings.Contains(blob, "linux") ||
+		strings.Contains(blob, "ubuntu") ||
+		strings.Contains(blob, "debian") ||
+		strings.Contains(blob, "fedora") ||
+		strings.Contains(blob, "arch"):
+		c.setClientOS("linux", "ntlm metadata heuristic", clientOSPrioNTLM)
+	}
+}
+
+func (c *conn) logClientProfile() {
+	c.m.Lock()
+	host := c.clientHost
+	osName := c.clientOS
+	c.profileLogged = true
+	c.m.Unlock()
+
+	if host == "" {
+		host = "unknown"
+	}
+	if osName == "" {
+		osName = "unknown"
+	}
+	if host == "unknown" {
+		c.infof("client profile: os=%s", osName)
+		return
+	}
+	c.infof("client profile: host=%s os=%s", host, osName)
+}
+
+func (c *conn) ensureDefaultClientOS() {
+	c.m.Lock()
+	osName := c.clientOS
+	c.m.Unlock()
+	if osName == "" || strings.EqualFold(osName, "unknown") {
+		c.setClientOS("windows", "default SMB client heuristic", clientOSPrioDefault)
+	}
+}
+
 // pendingSessionSetup holds state for a second session being established
 // on an already-active connection (e.g. Windows UAC elevation).
 type pendingSessionSetup struct {
-	spnego    *spnegoServer
-	sessionId uint64
+	spnego      *spnegoServer
+	sessionId   uint64
 	preauthHash [64]byte // running preauth hash for this binding
 }
 
@@ -263,7 +391,7 @@ func (conn *conn) runSender() {
 	for {
 		select {
 		case <-conn.wdone:
-			log.Tracef("runsender finished")
+			conn.tracef("runsender finished")
 			return
 		case pkt := <-conn.write:
 			_, err := conn.t.Write(pkt)
@@ -311,13 +439,13 @@ func (conn *conn) runReciever() {
 				p.Command() != SMB2_ECHO {
 				s := conn.getSession(p.SessionId())
 				if s == nil {
-					log.Tracef("skip: unknown session id (cmd %d, sid %d)", p.Command(), p.SessionId())
+					conn.tracef("skip: unknown session id (cmd %d, sid %d)", p.Command(), p.SessionId())
 					continue
 				}
 
 				if tc, ok := s.treeConnTables[p.TreeId()]; ok {
 					if tc.treeId != p.TreeId() {
-						log.Warningln("skip:", &InvalidResponseError{"unknown tree id"})
+						conn.warnf("skip: %v", &InvalidResponseError{"unknown tree id"})
 						continue
 					}
 				}
@@ -334,7 +462,7 @@ func (conn *conn) runReciever() {
 				goto exit
 			}
 			if log.IsLevelEnabled(log.TraceLevel) {
-				log.Tracef(
+				conn.tracef(
 					"req: cmd=%d mid=%d sid=%d tid=%d flags=0x%x len=%d",
 					p.Command(),
 					p.MessageId(),
@@ -365,13 +493,13 @@ func (conn *conn) runReciever() {
 			if hasSession {
 				e = conn.tryVerify(pkt, isEncrypted)
 				if e != nil {
-					log.Errorf("verify error: %v", e)
+					conn.errorf("verify error: %v", e)
 				}
 			}
 
 			e = conn.tryHandle(pkt, compCtx, e)
 			if e != nil {
-				log.Warningln("skip:", e)
+				conn.warnf("skip: %v", e)
 			}
 
 			if next == nil {
@@ -388,7 +516,7 @@ exit:
 		err = nil
 	default:
 		if !isNormalDisconnect(err) {
-			log.Errorln("error:", err)
+			conn.errorf("error: %v", err)
 		}
 	}
 
@@ -399,7 +527,7 @@ exit:
 
 	conn.err = err
 
-	log.Tracef("receiver finished")
+	conn.tracef("receiver finished")
 
 	conn.shutdown()
 }

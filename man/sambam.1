@@ -40,11 +40,11 @@ Allow client IP/CIDR. Repeatable.
 .BR "-r, --readonly"
 Make share read-only.
 .TP
-.BR "-u, --username" " <name>"
-Require authentication with this username.
+.BR "-u, --username" " <user|user:password>"
+Require authentication. Repeatable for multiple users.
 .TP
 .BR "-p, --password" " <password>"
-Authentication password (random if omitted with --username).
+Authentication password for single-user mode.
 .TP
 .BR "-e, --expire" " <duration>"
 Auto-shutdown after duration (for example: 30m, 1h, 2h30m).

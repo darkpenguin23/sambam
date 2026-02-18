@@ -55,6 +55,10 @@ func (fs *PassthroughFS) BasePath() string {
 	return fs.rootPath
 }
 
+func (fs *PassthroughFS) IsReadOnly() bool {
+	return fs.readOnly
+}
+
 func (fs *PassthroughFS) relativePath(fullPath string) string {
 	rel := strings.TrimPrefix(fullPath, fs.rootPath)
 	rel = strings.TrimPrefix(rel, "/")
@@ -273,7 +277,14 @@ func (fs *PassthroughFS) Lookup(handle vfs.VfsHandle, name string) (*vfs.Attribu
 		p = open.path
 	}
 
-	info, err := os.Lstat(path.Join(p, name))
+	fullPath := path.Join(p, name)
+	// For share root lookups, follow symlinks so roots like /bin -> /usr/bin
+	// are treated as directories by SMB clients.
+	lookup := os.Lstat
+	if handle == 0 && path.Clean(fullPath) == path.Clean(fs.rootPath) {
+		lookup = os.Stat
+	}
+	info, err := lookup(fullPath)
 	if err != nil {
 		return nil, err
 	}

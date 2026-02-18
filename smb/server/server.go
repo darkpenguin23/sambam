@@ -41,6 +41,10 @@ type Server struct {
 
 	shares     map[string]vfs.VFSFileSystem
 	origShares map[string]vfs.VFSFileSystem
+	shareGuest map[string]bool
+	shareUsers map[string]map[string]struct{}
+	authUsers  map[string]struct{}
+	userRO     map[string]bool
 
 	opens       map[uint64]*Open
 	opensByGuid map[Guid]*Open
@@ -169,6 +173,10 @@ type ServerConfig struct {
 	IgnoreSetAttrErr bool
 	AcceptSingleConn bool
 	HideDotfiles     bool                              // Hide files starting with '.'
+	ShareGuest       map[string]bool                   // share -> allow guest access
+	ShareAllowUsers  map[string][]string               // share -> allowed usernames (empty => all)
+	AuthUsers        []string                          // configured authenticated users
+	UserReadonly     map[string]bool                   // username(lowercase) -> readonly
 	AllowConn        func(remoteAddr string) bool      // Return true to allow a client connection
 	OnReject         func(remoteAddr string)           // Called when a client is rejected by allow policy
 	OnConnect        func(remoteAddr string)           // Called when a client connects
@@ -182,11 +190,48 @@ func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFile
 	for i, v := range shares {
 		newShares[strings.ToUpper(i)] = v
 	}
+	shareUsers := map[string]map[string]struct{}{}
+	authUsers := map[string]struct{}{}
+	for _, user := range cfg.AuthUsers {
+		u := strings.ToLower(strings.TrimSpace(user))
+		if u != "" {
+			authUsers[u] = struct{}{}
+		}
+	}
+	shareGuest := map[string]bool{}
+	for share, guest := range cfg.ShareGuest {
+		if guest {
+			shareGuest[strings.ToUpper(share)] = true
+		}
+	}
+	for share, users := range cfg.ShareAllowUsers {
+		key := strings.ToUpper(share)
+		set := map[string]struct{}{}
+		for _, u := range users {
+			u = strings.TrimSpace(strings.ToLower(u))
+			if u != "" {
+				set[u] = struct{}{}
+			}
+		}
+		if len(set) > 0 {
+			shareUsers[key] = set
+		}
+	}
+	userRO := map[string]bool{}
+	for user, ro := range cfg.UserReadonly {
+		if ro {
+			userRO[strings.ToLower(strings.TrimSpace(user))] = true
+		}
+	}
 
 	srv := &Server{
 		authenticator:    a,
 		shares:           newShares,
 		origShares:       shares,
+		shareGuest:       shareGuest,
+		shareUsers:       shareUsers,
+		authUsers:        authUsers,
+		userRO:           userRO,
 		opens:            map[uint64]*Open{},
 		allowGuest:       cfg.AllowGuest,
 		maxIOReads:       cfg.MaxIOReads,
@@ -213,6 +258,31 @@ func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFile
 	}
 
 	return srv
+}
+
+func (d *Server) isUserReadOnly(username string) bool {
+	return d.userRO[strings.ToLower(strings.TrimSpace(username))]
+}
+
+func (d *Server) isShareAllowed(shareName, username string) bool {
+	allowed, ok := d.shareUsers[strings.ToUpper(shareName)]
+	if !ok || len(allowed) == 0 {
+		return true
+	}
+	_, ok = allowed[strings.ToLower(strings.TrimSpace(username))]
+	return ok
+}
+
+func (d *Server) isShareGuest(shareName string) bool {
+	if d.allowGuest && len(d.shareGuest) == 0 {
+		return true
+	}
+	return d.shareGuest[strings.ToUpper(shareName)]
+}
+
+func (d *Server) isConfiguredUser(username string) bool {
+	_, ok := d.authUsers[strings.ToLower(strings.TrimSpace(username))]
+	return ok
 }
 
 func (d *Server) Serve(addr string) error {
@@ -303,6 +373,8 @@ func (d *Server) serveListener(listener net.Listener) {
 		conn := &conn{
 			t:                   direct(c),
 			remoteAddr:          remoteAddr,
+			clientOS:            "unknown",
+			clientOSSrc:         "initial",
 			sessions:            make(map[uint64]*session),
 			outstandingRequests: newOutstandingRequests(),
 			account:             a,
@@ -329,9 +401,9 @@ func (d *Server) serveListener(listener net.Listener) {
 		run := func() {
 			if err := conn.Run(); err != nil {
 				if !isNormalDisconnect(err) {
-					log.Errorf("err: %v", err)
+					conn.errorf("err: %v", err)
 				}
-				log.Infof("disconnect %s", c.RemoteAddr())
+				conn.infof("disconnect")
 				c.Close()
 				if d.acceptSingleConn {
 					d.active = false
@@ -460,14 +532,14 @@ func (c *conn) Run() error {
 			}
 		}
 		if err != nil {
-			log.Errorf("err: %v", err)
+			c.errorf("err: %v", err)
 			return err
 		}
 	}
 }
 
 func (c *conn) echo(ctx *compoundContext, pkt []byte) error {
-	log.Tracef("Echo")
+	c.tracef("Echo")
 
 	p := PacketCodec(pkt)
 	rsp := new(EchoResponse)
@@ -480,7 +552,7 @@ func (c *conn) echo(ctx *compoundContext, pkt []byte) error {
 }
 
 func (c *conn) negotiate(pkt []byte) error {
-	log.Debugf("negotiate")
+	c.debugf("negotiate")
 
 	if c.serverState != STATE_NEGOTIATE {
 		if c.useSession() {
@@ -497,7 +569,7 @@ func (c *conn) negotiate(pkt []byte) error {
 }
 
 func (c *conn) sessionSetup(pkt []byte) error {
-	log.Debugf("session setup")
+	c.debugf("session setup")
 
 	if c.useSession() {
 		p := PacketCodec(pkt)
@@ -511,7 +583,7 @@ func (c *conn) sessionSetup(pkt []byte) error {
 
 			s := c.getSession(reqSid)
 			if s == nil {
-				log.Tracef("session setup denied on active connection: unknown req sid=%d", reqSid)
+				c.tracef("session setup denied on active connection: unknown req sid=%d", reqSid)
 				rsp := new(ErrorResponse)
 				PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
 				return c.sendPacket(rsp, nil, nil)
@@ -543,12 +615,12 @@ func (c *conn) sessionSetup(pkt []byte) error {
 		break
 	}
 
-	log.Warnf("wrong connection state: %d", c.serverState)
+	c.warnf("wrong connection state: %d", c.serverState)
 	return &InvalidRequestError{"wrong connction state"}
 }
 
 func (c *conn) logoff(pkt []byte) error {
-	log.Debugf("logoff")
+	c.debugf("logoff")
 
 	p := PacketCodec(pkt)
 	rsp := new(LogoffResponse)
@@ -561,7 +633,7 @@ func (c *conn) logoff(pkt []byte) error {
 }
 
 func (c *conn) treeConnect(pkt []byte) error {
-	log.Debugf("tree connect")
+	c.debugf("tree connect")
 
 	p := PacketCodec(pkt)
 
@@ -575,7 +647,7 @@ func (c *conn) treeConnect(pkt []byte) error {
 		return &InvalidResponseError{"broken tree connect format"}
 	}
 
-	log.Debugf("tree connect path: %s", r.Path())
+	c.debugf("tree connect path: %s", r.Path())
 
 	rsp := new(TreeConnectResponse)
 	rsp.CreditRequestResponse = p.CreditRequest()
@@ -610,7 +682,7 @@ func (c *conn) treeConnect(pkt []byte) error {
 			tc = &ft.treeConn
 			c.treeMapByName["\\IPC$"] = ft
 			c.treeMapById[tc.treeId] = ft
-			log.Tracef("new ipc tree %d", tc.treeId)
+			c.tracef("new ipc tree %d", tc.treeId)
 		}
 
 		err = c.sendPacket(rsp, tc, nil)
@@ -625,10 +697,22 @@ func (c *conn) treeConnect(pkt []byte) error {
 		fs, ok := c.serverCtx.shares[strings.ToUpper(path)]
 		if !ok {
 			if fs, ok = c.serverCtx.shares[strings.ToUpper(path)+"$"]; !ok {
-				log.Tracef("shares: %v", maps.Keys(c.serverCtx.shares))
+				c.tracef("shares: %v", maps.Keys(c.serverCtx.shares))
 				rsp.Status = uint32(STATUS_BAD_NETWORK_NAME)
 				return c.sendPacket(rsp, nil, nil)
 			}
+		}
+		isGuestSession := c.session == nil || c.session.sessionFlags&SMB2_SESSION_FLAG_IS_GUEST != 0 || strings.EqualFold(c.session.username, "guest") || c.session.username == ""
+		if isGuestSession {
+			if !c.serverCtx.isShareGuest(path) {
+				c.warnf("share denied (guest disabled): %s user=%s", path, c.session.username)
+				rsp.Status = uint32(STATUS_ACCESS_DENIED)
+				return c.sendPacket(rsp, nil, nil)
+			}
+		} else if !c.serverCtx.isShareAllowed(path, c.session.username) {
+			c.warnf("share denied: %s user=%s", path, c.session.username)
+			rsp.Status = uint32(STATUS_ACCESS_DENIED)
+			return c.sendPacket(rsp, nil, nil)
 		}
 
 		rsp.ShareType = SMB2_SHARE_TYPE_DISK
@@ -665,7 +749,7 @@ func (c *conn) treeConnect(pkt []byte) error {
 			tc = &ft.treeConn
 			c.treeMapByName[path] = ft
 			c.treeMapById[tc.treeId] = ft
-			log.Infof("mounted share: %s", path)
+			c.infof("mounted share: %s", path)
 		}
 
 		err = c.sendPacket(rsp, tc, nil)
@@ -675,13 +759,13 @@ func (c *conn) treeConnect(pkt []byte) error {
 }
 
 func (c *conn) treeDisconnect(pkt []byte) error {
-	log.Debugf("tree disconnect")
+	c.debugf("tree disconnect")
 
 	p := PacketCodec(pkt)
 
 	tc, ok := c.treeMapById[p.TreeId()]
 	if !ok {
-		log.Warnf("tree doesn't exist: %d", p.TreeId())
+		c.warnf("tree doesn't exist: %d", p.TreeId())
 	}
 
 	var tree *treeConn = nil
@@ -690,7 +774,7 @@ func (c *conn) treeDisconnect(pkt []byte) error {
 		tree.refCount--
 		if tree.refCount == 0 {
 			if tree.path != "\\IPC$" {
-				log.Infof("unmounted share: %s", tree.path)
+				c.infof("unmounted share: %s", tree.path)
 			}
 			delete(c.treeMapByName, tree.path)
 			delete(c.treeMapById, tree.treeId)
@@ -752,7 +836,11 @@ func (n *ServerNegotiator) negotiate(conn *conn, pkt []byte) error {
 
 	n.Spnego = newSpnegoServer([]Authenticator{conn.serverCtx.authenticator})
 	outputToken, _ := n.Spnego.initSecContext()
-	log.Infof("negotiated dialect=%s signing=%t", dialectName(conn.dialect), conn.requireSigning)
+	signingMode := "optional"
+	if conn.requireSigning {
+		signingMode = "required"
+	}
+	conn.infof("negotiated dialect=%s signing=%s", dialectName(conn.dialect), signingMode)
 
 	if conn.dialect != SMB311 {
 		rsp, _ := n.makeResponse(conn)
@@ -808,7 +896,8 @@ func (n *ServerNegotiator) negotiate(conn *conn, pkt []byte) error {
 			}
 		case SMB2_POSIX_EXTENSIONS_AVAILABLE:
 			conn.posixExtensions = true
-			log.Debugf("POSIX extensions negotiated")
+			conn.setClientOS("linux", "posix negotiate context", clientOSPrioPOSIX)
+			conn.debugf("POSIX extensions negotiated")
 		default:
 			// skip unsupported context
 		}
@@ -959,13 +1048,13 @@ func (c *conn) calcPreauthHash(pkt []byte) {
 }
 
 func (c *conn) sessionServerSetup(pkt []byte) error {
-	log.Debugf("session setup step 1")
+	c.debugf("session setup step 1")
 
 	p := PacketCodec(pkt)
 
 	res, err := accept(SMB2_SESSION_SETUP, pkt)
 	if err != nil {
-		log.Debugf("session setup decode failed: %v", err)
+		c.debugf("session setup decode failed: %v", err)
 		rsp := new(ErrorResponse)
 		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_INVALID_PARAMETER))
 		return c.sendPacket(rsp, nil, nil)
@@ -975,7 +1064,7 @@ func (c *conn) sessionServerSetup(pkt []byte) error {
 
 	r := SessionSetupRequestDecoder(res)
 	if r.IsInvalid() {
-		log.Debugf("session setup invalid request")
+		c.debugf("session setup invalid request")
 		return &InvalidRequestError{"broken session setup request format"}
 	}
 
@@ -985,7 +1074,7 @@ func (c *conn) sessionServerSetup(pkt []byte) error {
 
 	outputToken, err := c.serverCtx.negotiator.Spnego.challenge(r.SecurityBuffer())
 	if err != nil {
-		log.Warnf("session setup challenge failed: %v", err)
+		c.warnf("session setup challenge failed: %v", err)
 		rsp := new(ErrorResponse)
 		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_LOGON_FAILURE))
 		return c.sendPacket(rsp, nil, nil)
@@ -1011,7 +1100,7 @@ func (c *conn) sessionServerSetup(pkt []byte) error {
 }
 
 func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
-	log.Debugf("session setup step 2")
+	c.debugf("session setup step 2")
 
 	p := PacketCodec(pkt)
 
@@ -1034,7 +1123,7 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		if c.serverCtx.onAuthFail != nil {
 			c.serverCtx.onAuthFail(c.remoteAddr, authFailedUserFromError(err))
 		}
-		log.Warnf("authentication failed: %v", err)
+		c.warnf("authentication failed: %v", err)
 		// Reset state so the client can retry with different credentials.
 		c.serverState = STATE_SESSION_SETUP
 		rsp := new(ErrorResponse)
@@ -1042,9 +1131,14 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		return c.sendPacket(rsp, nil, nil)
 	}
 
-	log.Infof("authenticated: %s", user)
+	if ntlmAuth, ok := c.serverCtx.negotiator.Spnego.selectedMech.(*NTLMAuthenticator); ok {
+		c.observeNTLMInfo(ntlmAuth.infoMap())
+	}
+	c.ensureDefaultClientOS()
+	c.logClientProfile()
+	c.infof("authenticated: %s", user)
 	flags := uint16(0)
-	if c.serverCtx.allowGuest {
+	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
 		flags = SMB2_SESSION_FLAG_IS_GUEST
 	}
 
@@ -1054,6 +1148,7 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		treeConnTables: make(map[uint32]*treeConn),
 		sessionFlags:   flags,
 		sessionId:      sessionId,
+		username:       user,
 	}
 
 	rsp := &SessionSetupResponse{
@@ -1184,7 +1279,7 @@ func (c *conn) deriveSessionKeys(s *session, sessionKey []byte, preauthHash [64]
 // connection.  This is used when Windows UAC elevation needs a second
 // session for the elevated process.
 func (c *conn) sessionSetupNewBinding(pkt []byte) error {
-	log.Debugf("session binding step 1 (new session on active connection)")
+	c.debugf("session binding step 1 (new session on active connection)")
 
 	p := PacketCodec(pkt)
 
@@ -1206,7 +1301,7 @@ func (c *conn) sessionSetupNewBinding(pkt []byte) error {
 
 	outputToken, err := bindSpnego.challenge(r.SecurityBuffer())
 	if err != nil {
-		log.Warnf("session binding challenge failed: %v", err)
+		c.warnf("session binding challenge failed: %v", err)
 		rsp := new(ErrorResponse)
 		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_LOGON_FAILURE))
 		return c.sendPacket(rsp, nil, nil)
@@ -1240,7 +1335,7 @@ func (c *conn) sessionSetupNewBinding(pkt []byte) error {
 	rsp.Status = uint32(STATUS_MORE_PROCESSING_REQUIRED)
 	rsp.SessionId = sessionId
 
-	log.Tracef("session binding: issued challenge, pending sid=%d", sessionId)
+	c.tracef("session binding: issued challenge, pending sid=%d", sessionId)
 
 	// sendPacket will hash the response into pendingSetup.preauthHash
 	// for SMB 3.1.1 (see conn.go sendPacket logic).
@@ -1249,7 +1344,7 @@ func (c *conn) sessionSetupNewBinding(pkt []byte) error {
 
 // sessionSetupCompleteBinding completes a pending session binding (step 2).
 func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
-	log.Debugf("session binding step 2 (completing binding)")
+	c.debugf("session binding step 2 (completing binding)")
 
 	p := PacketCodec(pkt)
 	ps := c.pendingSetup
@@ -1281,17 +1376,17 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 		if c.serverCtx.onAuthFail != nil {
 			c.serverCtx.onAuthFail(c.remoteAddr, authFailedUserFromError(err))
 		}
-		log.Warnf("session binding authentication failed: %v", err)
+		c.warnf("session binding authentication failed: %v", err)
 		c.pendingSetup = nil
 		rsp := new(ErrorResponse)
 		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_LOGON_FAILURE))
 		return c.sendPacket(rsp, nil, nil)
 	}
 
-	log.Infof("session binding authenticated: %s (sid=%d)", user, ps.sessionId)
+	c.infof("session binding authenticated: %s (sid=%d)", user, ps.sessionId)
 
 	flags := uint16(0)
-	if c.serverCtx.allowGuest {
+	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
 		flags = SMB2_SESSION_FLAG_IS_GUEST
 	}
 
@@ -1300,6 +1395,7 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 		treeConnTables: make(map[uint32]*treeConn),
 		sessionFlags:   flags,
 		sessionId:      ps.sessionId,
+		username:       user,
 	}
 
 	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {

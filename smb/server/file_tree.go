@@ -40,6 +40,23 @@ func shouldLogDirQueryDebug(key string) bool {
 	return true
 }
 
+func (t *fileTree) isUserReadOnly() bool {
+	if t.session == nil || t.session.conn == nil || t.session.conn.serverCtx == nil {
+		return false
+	}
+	return t.session.conn.serverCtx.isUserReadOnly(t.session.username)
+}
+
+func (t *fileTree) isShareReadOnly() bool {
+	type rofs interface {
+		IsReadOnly() bool
+	}
+	if fs, ok := t.fs.(rofs); ok {
+		return fs.IsReadOnly()
+	}
+	return false
+}
+
 type fileTree struct {
 	treeConn
 	fs vfs.VFSFileSystem
@@ -99,6 +116,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	if isEA {
 		name, eaKey = SplitEA(name)
 	}
+	shareReadOnly := t.isShareReadOnly()
 
 	if r.SmbCreateFlags() != 0 {
 		log.Errorf("Create flags: %d", r.SmbCreateFlags())
@@ -112,6 +130,24 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	err = nil
 	isSymlink := fileExists && (attrs.GetFileType() == vfs.FileTypeSymlink) && (r.CreateOptions()&FILE_OPEN_REPARSE_POINT == 0)
 	d := r.CreateDisposition()
+	deleteOnClose := r.CreateOptions()&FILE_DELETE_ON_CLOSE != 0
+	if (t.isUserReadOnly() || shareReadOnly) && deleteOnClose {
+		log.Warnf("deny create delete-on-close on read-only context user=%s path=%s", t.session.username, name)
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+	if t.isUserReadOnly() || shareReadOnly {
+		access := r.DesiredAccess()
+		wantsWrite := access&(FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_ATTRIBUTES|FILE_WRITE_EA|DELETE|WRITE_DAC|WRITE_OWNER|GENERIC_WRITE) != 0
+		createsOrMutates := d != FILE_OPEN || createDir
+		if wantsWrite || createsOrMutates {
+			log.Warnf("deny write create on read-only context user=%s path=%s", t.session.username, name)
+			rsp := new(ErrorResponse)
+			PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+			return c.sendPacket(rsp, &t.treeConn, ctx)
+		}
+	}
 
 	if fileExists && !isDir && createDir {
 		status := STATUS_OBJECT_NAME_COLLISION
@@ -300,6 +336,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 			}
 		case "AAPL":
 			t.aaplExtensions = true
+			t.session.conn.setClientOS("macOS", "AAPL create context", clientOSPrioAAPL)
 			if enc, err := t.handleAAPLCC(res.Buffer()); err == nil {
 				rsp.Contexts = append(rsp.Contexts, enc)
 			}
@@ -323,6 +360,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 			// Check for POSIX create context (16-byte GUID tag)
 			if t.session.conn.posixExtensions && len(ccName) == 16 && ccName == string(SMB2_CREATE_TAG_POSIX) {
 				log.Tracef("POSIX create context matched")
+				t.session.conn.setClientOS("linux", "POSIX create context", clientOSPrioPOSIX)
 				if enc, err := t.handlePosixCC(attrs); err == nil {
 					rsp.Contexts = append(rsp.Contexts, enc)
 				}
@@ -600,6 +638,9 @@ send:
 	if open != nil && open.deleteAfterClose {
 		if err := t.fs.Unlink(vfs.VfsHandle(fileId.HandleId())); err != nil {
 			log.Errorf("Delete failed: %v", err)
+			if rsp.Status == 0 {
+				rsp.Status = uint32(STATUS_ACCESS_DENIED)
+			}
 		} else if open.pathName != "" {
 			t.conn.serverCtx.notifyChange(open.pathName, FILE_ACTION_REMOVED)
 		}
@@ -836,6 +877,12 @@ func (t *fileTree) write(ctx *compoundContext, pkt []byte) error {
 	log.Tracef("write")
 
 	c := t.session.conn
+	if t.isUserReadOnly() {
+		log.Warnf("deny write for read-only user=%s", t.session.username)
+		rsp := new(ErrorResponse)
+		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_ACCESS_DENIED))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 
 	res, _ := accept(SMB2_WRITE, pkt)
 	r := WriteRequestDecoder(res)
@@ -2503,6 +2550,18 @@ func (t *fileTree) setPosixInfo(ctx *compoundContext, fileId *FileId, pkt []byte
 func (t *fileTree) setInfo(ctx *compoundContext, pkt []byte) error {
 	log.Tracef("SetInfo")
 	c := t.session.conn
+	if t.isUserReadOnly() {
+		log.Warnf("deny setinfo for read-only user=%s", t.session.username)
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+	if t.isShareReadOnly() {
+		log.Warnf("deny setinfo on read-only share")
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 
 	res, _ := accept(SMB2_SET_INFO, pkt)
 	r := SetInfoRequestDecoder(res)

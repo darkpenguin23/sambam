@@ -16,6 +16,7 @@ type session struct {
 	treeConnTables            map[uint32]*treeConn
 	sessionFlags              uint16
 	sessionId                 uint64
+	username                  string
 	preauthIntegrityHashValue [64]byte
 
 	signer    hash.Hash
