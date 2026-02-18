@@ -495,7 +495,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.21"
+	version = "1.4.22"
 )
 
 func main() {
