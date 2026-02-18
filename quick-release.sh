@@ -62,10 +62,11 @@ echo "▶ Creating git tag v$VERSION..."
 git tag "v$VERSION"
 echo "✓ Tag created on current commit"
 
-# Step 4: Push (ensure tag is on same commit before release)
-echo "▶ Pushing to remote..."
-git push origin master --tags 2>&1 | grep -v "rejected.*v1.4" || true
-echo "✓ Pushed to remote"
+# Step 4: Push to all remotes (ensure tag is on same commit before release)
+echo "▶ Pushing to remotes..."
+git push origin master --tags 2>&1 | grep -v "rejected" || true
+git push github master --tags 2>&1 | grep -v "rejected" || true
+echo "✓ Pushed to remotes"
 
 # Final check: Ensure clean state before release
 echo "▶ Final validation before release..."
