@@ -20,3 +20,6 @@ Thumbs.db
 # Release config and script (contains tokens)
 .release-config
 release.sh
+
+# Local generated config (for testing -G flag)
+.sambamrc
