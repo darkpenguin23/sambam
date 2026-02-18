@@ -245,11 +245,7 @@ Generate a TOML config from the currently passed CLI flags and exit without star
 
 - If no path is given, writes `./.sambamrc`
 - If a path is given, writes to that file
-- Generated config always uses the new schema (`[[users]]`, `[shares.<name>]`)
-- Auth generation supports one user only (`-u` once)
-- With `-u` + `-r`, read-only is written on that user (`[[users]].readonly = true`)
-- With `-u`, generated shares include `allow_users = ["<user>"]`
-- Without `-u`, generated shares include `guest = true`
+- Generated config includes users and shares based on passed flags
 
 ```bash
 sambam -r -u admin -p secret -G
@@ -273,9 +269,7 @@ sambam has two config loading modes:
 
 CLI flags override all config values.
 
-### Config Schema (Supported)
-
-Only the new schema is supported.
+### Configuration Layout
 
 ```bash
 sambam -n docs:/data/docs -u admin -p secret -r -G
@@ -283,20 +277,72 @@ sambam -n docs:/data/docs -u admin -p secret -r -G
 
 ```toml
 listen = "0.0.0.0:445"
+# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
+
+allow = ["10.23.0.0/16"]
+readonly = false
+hide_dotfiles = false
+
+verbose = true
+# verbose_level = 2
+# verbose_level = 3
+debug = false
+trace = false
+
+expire = "1h"
+pidfile = "/tmp/sambam.pid"
+logfile = "/tmp/sambam.log"
+
 [[users]]
-name = "admin"
+name = "alice"
 password = "secret1"
+readonly = false
+
+[[users]]
+name = "bob"
+password = "secret2"
 readonly = true
 
 [shares.docs]
-path = "/data/docs"
-allow_users = ["admin"]
+path = "/tmp/docs"
+allow_users = ["alice", "bob"]
+readonly = false
+
+[shares.private]
+path = "/tmp/private"
+allow_users = ["alice"]
+readonly = true
+
+[shares.public]
+path = "/tmp/public"
+guest = true
+readonly = false
 ```
 
+Global options:
+- `listen` / `listen_addrs`
+- `allow`
+- `hide_dotfiles`
+- `readonly`
+- `expire`
+- `pidfile`
+- `logfile`
+- `verbose` / `verbose_level`
+
+Per-user options (`[[users]]`):
+- `name`
+- `password`
+- `readonly`
+
+Per-share options (`[shares.<name>]`):
+- `path`
+- `readonly`
+- `guest`
+- `allow_users`
+
 Notes:
-- `guest = true` allows anonymous/guest access for that share.
-- `allow_users` restricts a share to specific users.
-- share entries use `[shares.<name>]`.
+- `guest = true` allows anonymous access for that share.
+- `allow_users` restricts a share to specific authenticated users.
 
 See `sambamrc.example` for a full example.
 

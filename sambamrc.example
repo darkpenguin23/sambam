@@ -2,52 +2,57 @@
 # Place this file at /etc/sambamrc, ~/.sambamrc, or ./.sambamrc
 # CLI flags override these settings.
 
-# Listen address (default: 0.0.0.0:445)
-# Supports IP:port or @interface[:port], e.g. "@eth0:445"
+# Listen address (single endpoint)
 listen = "0.0.0.0:445"
-# Optional multi-listener variant:
+
+# Listen addresses (multi-endpoint variant; use instead of listen)
+# Supports IP:port or @interface[:port], e.g. "@eth0:445"
 # listen_addrs = ["@eth0:445", "10.23.22.13:445"]
 
-# Allowlist clients (optional)
-# allow = ["192.168.1.10", "192.168.2.0/24"]
+# Allowlist clients (IP or CIDR)
+allow = ["10.23.0.0/16"]
 
-# Read-only mode
+# Global defaults
+readonly = false
+hide_dotfiles = false
+
+# Verbosity (choose one style)
+verbose = true
+# verbose_level = 2
+# verbose_level = 3
+
+# Compatibility options (equivalent to verbose_level=3 when true)
+debug = false
+trace = false
+
+# Runtime controls
+expire = "1h"
+pidfile = "/tmp/sambam.pid"
+logfile = "/tmp/sambam.log"
+
+# Users
+[[users]]
+name = "alice"
+password = "secret1"
 readonly = false
 
-# Show connections and file activity
-verbose = true
-# verbose_level = 2   # equivalent to -vv
-# verbose_level = 3   # equivalent to -vvv
+[[users]]
+name = "bob"
+password = "secret2"
+readonly = true
 
-# Hide files starting with '.'
-# hide_dotfiles = true
-
-# Authentication
-# [[users]]
-# name = "alice"
-# password = "secret1"
-#
-# [[users]]
-# name = "bob"
-# password = "secret2"
-# readonly = true
-
-# Auto-expire (optional, e.g. 30m, 1h, 2h30m)
-# expire = "30m"
-
-# Daemon mode settings
-# pidfile = "/tmp/sambam.pid"
-# logfile = "/var/log/sambam.log"
-
-# Shares (new style only)
+# Shares
 [shares.docs]
 path = "/tmp/docs"
+allow_users = ["alice", "bob"]
+readonly = false
 
 [shares.private]
 path = "/tmp/private"
+allow_users = ["alice"]
 readonly = true
-# allow_users = ["alice"]
 
 [shares.public]
 path = "/tmp/public"
 guest = true
+readonly = false
