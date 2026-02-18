@@ -33,7 +33,6 @@ type Share struct {
 	ReadOnly   bool
 	Guest      bool
 	AllowUsers []string
-	Legacy     bool
 }
 
 type ShareConfig struct {
@@ -48,7 +47,6 @@ type shareFieldMask struct {
 	Readonly   bool
 	Guest      bool
 	AllowUsers bool
-	Legacy     bool
 }
 
 type UserConfig struct {
@@ -68,8 +66,6 @@ type Config struct {
 	Trace        bool         `toml:"trace"`
 	Allow        []string     `toml:"allow"`
 	HideDotfiles bool         `toml:"hide_dotfiles"`
-	Username     string       `toml:"username"`
-	Password     string       `toml:"password"`
 	Users        []UserConfig `toml:"users"`
 	Expire       string       `toml:"expire"`
 	PidFile      string       `toml:"pidfile"`
@@ -101,9 +97,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		Trace        bool                      `toml:"trace"`
 		Allow        []string                  `toml:"allow"`
 		HideDotfiles bool                      `toml:"hide_dotfiles"`
-		Username     string                    `toml:"username"`
-		Password     string                    `toml:"password"`
-		Users        []UserConfig              `toml:"users"`
+		Users        []toml.Primitive          `toml:"users"`
 		Expire       string                    `toml:"expire"`
 		PidFile      string                    `toml:"pidfile"`
 		LogFile      string                    `toml:"logfile"`
@@ -115,6 +109,9 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	if err != nil {
 		return nil, md, err
 	}
+	if md.IsDefined("username") || md.IsDefined("password") {
+		return nil, md, fmt.Errorf("legacy config keys username/password are no longer supported; use [[users]] entries")
+	}
 	cfg := &Config{
 		Listen:       raw.Listen,
 		ListenAddrs:  append([]string(nil), raw.ListenAddrs...),
@@ -125,9 +122,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		Trace:        raw.Trace,
 		Allow:        append([]string(nil), raw.Allow...),
 		HideDotfiles: raw.HideDotfiles,
-		Username:     raw.Username,
-		Password:     raw.Password,
-		Users:        append([]UserConfig(nil), raw.Users...),
+		Users:        []UserConfig{},
 		Expire:       raw.Expire,
 		PidFile:      raw.PidFile,
 		LogFile:      raw.LogFile,
@@ -136,19 +131,13 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	}
 
 	for name, prim := range raw.Shares {
-		var pathOnly string
-		if err := md.PrimitiveDecode(prim, &pathOnly); err == nil {
-			cfg.Shares[name] = ShareConfig{Path: pathOnly}
-			cfg.shareMask[name] = shareFieldMask{Path: true, Legacy: true}
-			continue
-		}
 		var rawShare map[string]interface{}
 		if err := md.PrimitiveDecode(prim, &rawShare); err != nil {
-			return nil, md, fmt.Errorf("invalid shares.%s: expected string path or table", name)
+			return nil, md, fmt.Errorf("invalid shares.%s: expected table [shares.%s], legacy string form is no longer supported", name, name)
 		}
 		var share ShareConfig
 		if err := md.PrimitiveDecode(prim, &share); err != nil {
-			return nil, md, fmt.Errorf("invalid shares.%s: expected string path or table", name)
+			return nil, md, fmt.Errorf("invalid shares.%s: expected table [shares.%s]", name, name)
 		}
 		cfg.Shares[name] = share
 		mask := shareFieldMask{}
@@ -164,8 +153,18 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		if _, ok := rawShare["allow_users"]; ok {
 			mask.AllowUsers = true
 		}
-		mask.Legacy = false
 		cfg.shareMask[name] = mask
+	}
+	for i, prim := range raw.Users {
+		var rawUser map[string]interface{}
+		if err := md.PrimitiveDecode(prim, &rawUser); err != nil {
+			return nil, md, fmt.Errorf("invalid users[%d]: expected table [[users]]", i)
+		}
+		var user UserConfig
+		if err := md.PrimitiveDecode(prim, &user); err != nil {
+			return nil, md, fmt.Errorf("invalid users[%d]: expected table [[users]]", i)
+		}
+		cfg.Users = append(cfg.Users, user)
 	}
 
 	return cfg, md, nil
@@ -199,12 +198,6 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	if md.IsDefined("hide_dotfiles") {
 		dst.HideDotfiles = src.HideDotfiles
 	}
-	if md.IsDefined("username") {
-		dst.Username = src.Username
-	}
-	if md.IsDefined("password") {
-		dst.Password = src.Password
-	}
 	if md.IsDefined("users") {
 		dst.Users = append([]UserConfig(nil), src.Users...)
 	}
@@ -230,7 +223,6 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 			dstMask := dst.shareMask[name]
 			if mask.Path {
 				cur.Path = share.Path
-				dstMask.Legacy = mask.Legacy
 			}
 			if mask.Readonly {
 				cur.Readonly = share.Readonly
@@ -281,12 +273,6 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	}
 	if md.IsDefined("hide_dotfiles") {
 		record("hide_dotfiles")
-	}
-	if md.IsDefined("username") {
-		record("username")
-	}
-	if md.IsDefined("password") {
-		record("password")
 	}
 	if md.IsDefined("users") {
 		record("users")
@@ -343,13 +329,6 @@ func configValueString(cfg *Config, key string) string {
 		return strings.Join(cfg.Allow, ",")
 	case "hide_dotfiles":
 		return strconv.FormatBool(cfg.HideDotfiles)
-	case "username":
-		return cfg.Username
-	case "password":
-		if cfg.Password == "" {
-			return ""
-		}
-		return "<set>"
 	case "users":
 		return strconv.Itoa(len(cfg.Users))
 	case "expire":
@@ -553,7 +532,7 @@ func main() {
 
 	// Auto-expire flag
 	expireStr := pflag.StringP("expire", "e", "", "Auto-shutdown after duration (e.g., 30m, 1h, 2h30m)")
-	generateConfigPath := pflag.StringP("gen-config", "G", "", "Generate config TOML and exit (optional path)")
+	generateConfigPath := pflag.StringP("gen-config", "G", "", "Generate new-style config TOML and exit (optional path)")
 	pflag.Lookup("gen-config").NoOptDefVal = ".sambamrc"
 
 	os.Args = normalizeCLIArgs(os.Args)
@@ -590,12 +569,6 @@ func main() {
 		if !pflag.CommandLine.Changed("allow") && len(config.Allow) > 0 {
 			*allowAddrs = append([]string(nil), config.Allow...)
 		}
-		if !pflag.CommandLine.Changed("username") && config.Username != "" {
-			*userSpecs = []string{config.Username}
-		}
-		if !pflag.CommandLine.Changed("password") && config.Password != "" {
-			*password = config.Password
-		}
 		if !pflag.CommandLine.Changed("expire") && config.Expire != "" {
 			*expireStr = config.Expire
 		}
@@ -617,10 +590,6 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
-	}
-	legacyAuthUser := ""
-	if config != nil && !pflag.CommandLine.Changed("username") && !pflag.CommandLine.Changed("password") {
-		legacyAuthUser = strings.TrimSpace(config.Username)
 	}
 	allowNets, err := parseAllowedNetworks(*allowAddrs)
 	if err != nil {
@@ -651,19 +620,11 @@ func main() {
 	}
 	effectiveConfig.Readonly = *readOnly
 	effectiveConfig.HideDotfiles = *hideDotfiles
-	if len(authUsers) == 1 {
-		for _, u := range authUsers {
-			effectiveConfig.Username = u.Name
-			effectiveConfig.Password = u.Password
-		}
-		effectiveConfig.Users = nil
-	} else if len(authUsers) > 1 {
-		effectiveConfig.Username = ""
-		effectiveConfig.Password = ""
+	if len(authUsers) > 1 {
+		effectiveConfig.Users = authUsersToConfig(authUsers)
+	} else if len(authUsers) == 1 {
 		effectiveConfig.Users = authUsersToConfig(authUsers)
 	} else {
-		effectiveConfig.Username = ""
-		effectiveConfig.Password = ""
 		effectiveConfig.Users = nil
 	}
 	effectiveConfig.Expire = *expireStr
@@ -714,13 +675,7 @@ func main() {
 		markCLI("hide_dotfiles")
 	}
 	if pflag.CommandLine.Changed("username") {
-		markCLI("username")
-		if len(*userSpecs) > 1 {
-			markCLI("users")
-		}
-	}
-	if pflag.CommandLine.Changed("password") {
-		markCLI("password")
+		markCLI("users")
 	}
 	if pflag.CommandLine.Changed("expire") {
 		markCLI("expire")
@@ -865,17 +820,6 @@ func main() {
 				logrus.Debug(msg)
 			}
 		}
-		if *verbose >= 2 && config != nil && len(config.Users) > 0 && strings.TrimSpace(config.Username) != "" && !pflag.CommandLine.Changed("username") && !pflag.CommandLine.Changed("password") {
-			userSrc := configInfo.SettingSrc["users"]
-			legacySrc := configInfo.SettingSrc["username"]
-			if userSrc == "" {
-				userSrc = "config"
-			}
-			if legacySrc == "" {
-				legacySrc = "config"
-			}
-			logrus.Debugf("config auth merge: users <- %s + legacy username=%q <- %s (total users=%d)", userSrc, config.Username, legacySrc, len(authUsers))
-		}
 	}
 
 	// Parse shares.
@@ -901,7 +845,6 @@ func main() {
 				ReadOnly:   sc.Readonly || *readOnly,
 				Guest:      sc.Guest,
 				AllowUsers: append([]string(nil), sc.AllowUsers...),
-				Legacy:     config.shareMask[name].Legacy,
 			}
 		}
 	}
@@ -919,7 +862,6 @@ func main() {
 			s.Guest = prev.Guest
 			s.AllowUsers = append([]string(nil), prev.AllowUsers...)
 			s.ReadOnly = prev.ReadOnly || *readOnly
-			s.Legacy = prev.Legacy
 		}
 		shareMap[name] = s
 	} else if len(*shareSpecs) > 0 {
@@ -947,7 +889,6 @@ func main() {
 				s.Guest = prev.Guest
 				s.AllowUsers = append([]string(nil), prev.AllowUsers...)
 				s.ReadOnly = prev.ReadOnly || *readOnly
-				s.Legacy = prev.Legacy
 			}
 			shareMap[name] = s
 		}
@@ -972,6 +913,14 @@ func main() {
 	sort.Strings(shareNames)
 	for _, name := range shareNames {
 		shares = append(shares, shareMap[name])
+	}
+
+	// Validate per-share access policy: guest and allow_users are mutually exclusive.
+	for _, share := range shares {
+		if share.Guest && len(share.AllowUsers) > 0 {
+			fmt.Fprintf(os.Stderr, "Error: shares.%s has conflicting access settings: guest=true cannot be combined with allow_users\n", share.Name)
+			os.Exit(1)
+		}
 	}
 
 	// Verify all share directories exist
@@ -1095,22 +1044,7 @@ func main() {
 	for _, share := range shares {
 		fs := NewPassthroughFS(share.Path, share.ReadOnly)
 
-		// Setup filesystem callbacks for verbose mode
-		if *verbose > 0 {
-			fs.OnCreate = func(path string, isDir bool) {
-				typeStr := "file"
-				if isDir {
-					typeStr = "dir"
-				}
-				logrus.Infof("create: %s %s", typeStr, path)
-			}
-			fs.OnOverwrite = func(path string) {
-				logrus.Infof("replace: %s", path)
-			}
-			fs.OnDelete = func(path string) {
-				logrus.Infof("delete: %s", path)
-			}
-		}
+		// Note: create/replace/delete logs are emitted in SMB handlers so they carry client context.
 		if extraVerbose {
 			fs.OnOpen = func(path string, mode string) {
 				path = normalizeLogPath(path)
@@ -1152,15 +1086,11 @@ func main() {
 
 	// Setup verbose/debug callbacks
 	var onConnect func(string)
-	var onRename func(string, string)
 	var onDetect func(string, string)
 	var onAuthFail func(string, string)
 	if *verbose > 0 {
 		onConnect = func(remoteAddr string) {
 			logrus.Infof("connect: %s", remoteAddr)
-		}
-		onRename = func(from, to string) {
-			logrus.Infof("rename: %s -> %s", from, to)
 		}
 		onDetect = func(action, path string) {
 			logrus.Infof("detected: %s %s", action, path)
@@ -1194,15 +1124,6 @@ func main() {
 		if share.Guest {
 			shareGuest[share.Name] = true
 			guestShareExists = true
-		} else if len(share.AllowUsers) == 0 && share.Legacy {
-			if legacyAuthUser != "" {
-				shareAllowUsers[share.Name] = []string{legacyAuthUser}
-				configMergeLogs = append(configMergeLogs, fmt.Sprintf("config merge: shares.%s legacy -> allow_users=%q (from legacy username)", share.Name, legacyAuthUser))
-			} else {
-				shareGuest[share.Name] = true
-				guestShareExists = true
-				configMergeLogs = append(configMergeLogs, fmt.Sprintf("config merge: shares.%s legacy -> guest=true (no legacy username/password)", share.Name))
-			}
 		}
 		if len(share.AllowUsers) > 0 {
 			shareAllowUsers[share.Name] = append([]string(nil), share.AllowUsers...)
@@ -1229,7 +1150,6 @@ func main() {
 				logrus.Warnf("reject: %s (not in allow list)", remoteAddr)
 			},
 			OnConnect:  onConnect,
-			OnRename:   onRename,
 			OnDetect:   onDetect,
 			OnAuthFail: onAuthFail,
 		},
@@ -1572,7 +1492,7 @@ func printUsage() {
 	printOpt("-P, --pidfile", "PID file location "+Dim("(default: /tmp/sambam.pid)"))
 	printOpt("-L, --logfile", "Log file path "+Dim("(default /tmp/sambam.log when omitted)"))
 	printOpt("-c, --config", "Config file "+Dim("(repeatable, disables default config discovery)"))
-	printOpt("-G, --gen-config", "Generate config TOML and exit "+Dim("(default: ./.sambamrc)"))
+	printOpt("-G, --gen-config", "Generate new-style config TOML and exit "+Dim("(default: ./.sambamrc)"))
 	printOpt("-V, --version", "Show version")
 	printOpt("-h, --help", "Show help")
 	fmt.Println()
@@ -1620,6 +1540,8 @@ func normalizeCLIArgs(args []string) []string {
 func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, userSpecs []string, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
 	var b bytes.Buffer
 	written := []string{}
+	writeUserReadonly := false
+	generatedUser := ""
 	b.WriteString("# sambam generated configuration\n")
 	b.WriteString("# CLI flags override these settings.\n\n")
 
@@ -1656,9 +1578,6 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	if pflag.CommandLine.Changed("allow") {
 		writeStringArray("allow", allowAddrs)
 	}
-	if pflag.CommandLine.Changed("readonly") {
-		writeBool("readonly", readOnly)
-	}
 	if pflag.CommandLine.Changed("verbose") {
 		if verbose <= 1 {
 			writeBool("verbose", verbose > 0)
@@ -1669,32 +1588,6 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	if pflag.CommandLine.Changed("hide-dotfiles") {
 		writeBool("hide_dotfiles", hideDotfiles)
 	}
-	if pflag.CommandLine.Changed("username") {
-		users, err := buildAuthUsers(userSpecs, password, true, pflag.CommandLine.Changed("password"), nil)
-		if err != nil {
-			return nil, err
-		}
-		if len(users) == 1 && !users[0].Readonly {
-			writeString("username", users[0].Name)
-			writeString("password", users[0].Password)
-		} else if len(users) > 1 || (len(users) == 1 && users[0].Readonly) {
-			b.WriteString("\n")
-			for i, u := range users {
-				b.WriteString("[[users]]\n")
-				fmt.Fprintf(&b, "name = %s\n", strconv.Quote(u.Name))
-				fmt.Fprintf(&b, "password = %s\n", strconv.Quote(u.Password))
-				written = append(written, fmt.Sprintf("users[%d].name=%q", i, u.Name))
-				written = append(written, fmt.Sprintf("users[%d].password=%q", i, u.Password))
-				if u.Readonly {
-					b.WriteString("readonly = true\n")
-					written = append(written, fmt.Sprintf("users[%d].readonly=true", i))
-				}
-				b.WriteString("\n")
-			}
-		}
-	} else if pflag.CommandLine.Changed("password") {
-		return nil, fmt.Errorf("password requires username. Use -u/--username together with -p/--password")
-	}
 	if pflag.CommandLine.Changed("expire") {
 		writeString("expire", expire)
 	}
@@ -1704,18 +1597,51 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	if pflag.CommandLine.Changed("logfile") {
 		writeString("logfile", logFile)
 	}
+	if pflag.CommandLine.Changed("username") {
+		users, err := buildAuthUsers(userSpecs, password, true, pflag.CommandLine.Changed("password"), nil)
+		if err != nil {
+			return nil, err
+		}
+		if len(users) != 1 {
+			return nil, fmt.Errorf("gen-config supports only a single user. Use one -u/--username value")
+		}
+		u := users[0]
+		generatedUser = u.Name
+		b.WriteString("\n[[users]]\n")
+		fmt.Fprintf(&b, "name = %s\n", strconv.Quote(u.Name))
+		fmt.Fprintf(&b, "password = %s\n", strconv.Quote(u.Password))
+		written = append(written, fmt.Sprintf("users[0].name=%q", u.Name))
+		written = append(written, fmt.Sprintf("users[0].password=%q", u.Password))
+		if readOnly {
+			writeUserReadonly = true
+			b.WriteString("readonly = true\n")
+			written = append(written, "users[0].readonly=true")
+		}
+	} else if pflag.CommandLine.Changed("password") {
+		return nil, fmt.Errorf("password requires username. Use -u/--username together with -p/--password")
+	}
+	if pflag.CommandLine.Changed("readonly") && !writeUserReadonly {
+		writeBool("readonly", readOnly)
+	}
 
 	shares := buildSharesForConfig(shareSpecs, args)
 	if len(shares) > 0 {
-		b.WriteString("\n[shares]\n")
 		names := make([]string, 0, len(shares))
 		for name := range shares {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintf(&b, "%s = %s\n", name, strconv.Quote(shares[name]))
-			written = append(written, fmt.Sprintf("shares.%s=%q", name, shares[name]))
+			fmt.Fprintf(&b, "\n[shares.%s]\n", name)
+			fmt.Fprintf(&b, "path = %s\n", strconv.Quote(shares[name]))
+			written = append(written, fmt.Sprintf("shares.%s.path=%q", name, shares[name]))
+			if generatedUser != "" {
+				fmt.Fprintf(&b, "allow_users = [%s]\n", strconv.Quote(generatedUser))
+				written = append(written, fmt.Sprintf("shares.%s.allow_users=%q", name, generatedUser))
+			} else {
+				fmt.Fprintf(&b, "guest = true\n")
+				written = append(written, fmt.Sprintf("shares.%s.guest=true", name))
+			}
 		}
 	}
 
@@ -1921,7 +1847,7 @@ func buildAuthUsers(cliUsers []string, cliPassword string, cliUsersChanged bool,
 
 	if cfg != nil {
 		byName := map[string]authUser{}
-		users := make([]authUser, 0, len(cfg.Users)+1)
+		users := make([]authUser, 0, len(cfg.Users))
 		for _, u := range cfg.Users {
 			name := strings.TrimSpace(u.Name)
 			if name == "" {
@@ -1932,18 +1858,6 @@ func buildAuthUsers(cliUsers []string, cliPassword string, cliUsersChanged bool,
 			}
 			key := strings.ToLower(name)
 			byName[key] = authUser{Name: name, Password: u.Password, Readonly: u.Readonly}
-		}
-		if cfg.Username != "" {
-			pass := cfg.Password
-			if pass == "" {
-				pass = generatePassword(10)
-			}
-			key := strings.ToLower(strings.TrimSpace(cfg.Username))
-			if key != "" {
-				// Legacy username/password is additive with [[users]], preserving
-				// compatibility with generated configs layered with manual ones.
-				byName[key] = authUser{Name: strings.TrimSpace(cfg.Username), Password: pass}
-			}
 		}
 		for _, u := range byName {
 			users = append(users, u)

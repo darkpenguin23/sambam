@@ -13,17 +13,19 @@ sambam \- instant SMB/CIFS file sharing
 starts a lightweight SMB server to share local directories with Windows, macOS, and Linux clients.
 By default, it shares the current directory using the directory name as share name.
 .SH CONFIGURATION
-Configuration is loaded in this order, with later layers overriding keys set earlier:
+When
+.B -c, --config
+is not used, configuration is loaded in this order, with later layers overriding keys set earlier:
 .IP "1." 4
 .I /etc/sambamrc
 .IP "2." 4
 .I ~/.sambamrc
 .IP "3." 4
 .I ./.sambamrc
-.IP "4." 4
-Each
+.PP
+When
 .B -c, --config
-file in the order passed
+is used, default discovery is disabled and only explicit config files are loaded in the order passed.
 .PP
 Command-line flags override all config file values.
 .SH OPTIONS
@@ -69,7 +71,7 @@ Log file path. Defaults to
 when value is omitted.
 .TP
 .BR "-c, --config" " <path>"
-Load an additional config file. Repeatable. Applied after default config layers.
+Load explicit config file(s). Repeatable. Disables default config discovery.
 .TP
 .BR "-G, --gen-config" " [path]"
 Generate TOML config from current CLI flags and exit without starting the server.

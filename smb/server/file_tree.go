@@ -154,7 +154,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 		if d != FILE_CREATE {
 			status = STATUS_NOT_A_DIRECTORY
 		}
-		log.Errorf("requested file exists and it's not a directory")
+		log.Tracef("create dir probe on non-directory path: %s", name)
 		rsp := new(ErrorResponse)
 		PrepareResponse(&rsp.PacketHeader, pkt, uint32(status))
 		return c.sendPacket(rsp, &t.treeConn, ctx)
@@ -402,6 +402,18 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	}
 
 	err = c.sendPacket(rsp, &t.treeConn, ctx)
+	if err == nil && !isEA && name != "" {
+		switch action {
+		case FILE_CREATED:
+			typeStr := "file"
+			if isDir {
+				typeStr = "dir"
+			}
+			c.infof("create: %s %s", typeStr, name)
+		case FILE_OVERWRITTEN, FILE_SUPERSEDED:
+			c.infof("replace: %s", name)
+		}
+	}
 
 	// Notify directory watchers of file changes (after response is sent)
 	if !isEA && name != "" {
@@ -642,6 +654,7 @@ send:
 				rsp.Status = uint32(STATUS_ACCESS_DENIED)
 			}
 		} else if open.pathName != "" {
+			c.infof("delete: %s", open.pathName)
 			t.conn.serverCtx.notifyChange(open.pathName, FILE_ACTION_REMOVED)
 		}
 	}
@@ -2319,10 +2332,11 @@ func (t *fileTree) setRename(ctx *compoundContext, fileId *FileId, pkt []byte) e
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
-	if t.conn.serverCtx.onRename != nil {
-		t.conn.serverCtx.onRename(open.pathName, to)
-	} else {
-		log.Infof("rename: %s -> %s", open.pathName, to)
+	if open != nil {
+		c.infof("rename: %s -> %s", open.pathName, to)
+		if t.conn.serverCtx.onRename != nil {
+			t.conn.serverCtx.onRename(open.pathName, to)
+		}
 	}
 
 	rsp := new(SetInfoResponse)

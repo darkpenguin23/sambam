@@ -245,6 +245,11 @@ Generate a TOML config from the currently passed CLI flags and exit without star
 
 - If no path is given, writes `./.sambamrc`
 - If a path is given, writes to that file
+- Generated config always uses the new schema (`[[users]]`, `[shares.<name>]`)
+- Auth generation supports one user only (`-u` once)
+- With `-u` + `-r`, read-only is written on that user (`[[users]].readonly = true`)
+- With `-u`, generated shares include `allow_users = ["<user>"]`
+- Without `-u`, generated shares include `guest = true`
 
 ```bash
 sambam -r -u admin -p secret -G
@@ -268,10 +273,9 @@ sambam has two config loading modes:
 
 CLI flags override all config values.
 
-### Basic Config (Recommended)
+### Config Schema (Supported)
 
-Use the old-style format unless you need per-user/per-share controls.  
-It maps directly to CLI flags and is easy to generate with `-G`.
+Only the new schema is supported.
 
 ```bash
 sambam -n docs:/data/docs -u admin -p secret -r -G
@@ -279,59 +283,20 @@ sambam -n docs:/data/docs -u admin -p secret -r -G
 
 ```toml
 listen = "0.0.0.0:445"
-readonly = true
-username = "admin"
-password = "secret"
-
-[shares]
-docs = "/data/docs"
-```
-
-Why recommended:
-- follows CLI behavior
-- easiest to read and maintain
-- can be generated quickly with `-G`
-
-### Advanced Config
-
-Use this when you need multiple users, per-user readonly, or per-share access rules.
-
-```toml
 [[users]]
-name = "alice"
+name = "admin"
 password = "secret1"
-
-[[users]]
-name = "bob"
-password = "secret2"
 readonly = true
 
-[shares.media]
-path = "/mnt/media"
-guest = true
-
-[shares.private]
-path = "/home/user/private"
-readonly = true
-allow_users = ["alice"]
+[shares.docs]
+path = "/data/docs"
+allow_users = ["admin"]
 ```
 
 Notes:
 - `guest = true` allows anonymous/guest access for that share.
 - `allow_users` restricts a share to specific users.
-- advanced share entries use `[shares.<name>]`.
-
-### Mixing Basic + Advanced
-
-Mixing works, but is not recommended unless you know why you need it.
-
-Mix rules:
-- legacy share entries from `[shares]` can be overlaid by `[shares.<name>]` in later config files
-- legacy share without explicit advanced rule uses legacy auth mapping
-- with legacy `username/password`, it is treated as `allow_users=["<legacy-user>"]`
-- without legacy `username/password`, it is treated as guest-accessible
-
-Use `-vv` to see effective settings and merge decisions in logs.
+- share entries use `[shares.<name>]`.
 
 See `sambamrc.example` for a full example.
 

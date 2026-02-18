@@ -22,11 +22,7 @@ verbose = true
 # Hide files starting with '.'
 # hide_dotfiles = true
 
-# Authentication (single-user legacy style)
-# username = "admin"
-# password = "secret123"
-
-# Authentication (multi-user style)
+# Authentication
 # [[users]]
 # name = "alice"
 # password = "secret1"
@@ -43,12 +39,7 @@ verbose = true
 # pidfile = "/tmp/sambam.pid"
 # logfile = "/var/log/sambam.log"
 
-# Shares - legacy shorthand
-# [shares]
-# docs = "/tmp/docs"
-# pics = "/tmp/pics"
-
-# Shares - per-share controls
+# Shares (new style only)
 [shares.docs]
 path = "/tmp/docs"
 
