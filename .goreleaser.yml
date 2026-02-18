@@ -68,6 +68,14 @@ archives:
       - goos: windows
         formats: [zip]
 
+upx:
+  - enabled: true
+    ids:
+      - sambam-linux
+    compress: best
+    lzma: false
+    brute: false
+
 checksum:
   name_template: checksums.txt
 
