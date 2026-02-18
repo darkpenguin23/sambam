@@ -1263,12 +1263,16 @@ func main() {
 
 	// Optional Bonjour/mDNS + WS-Discovery advertisement for discovery.
 	var discovery *discoveryAdvertiser
+	advertiseStarted := false
 	if advertiseEnabled {
 		discovery, err = startSMBAdvertiser(shares, listenEndpoints, listenPort, authUsers, *allowAddrs)
 		if err != nil {
 			logrus.Warnf("advertise disabled: %v", err)
 		} else {
-			logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
+			advertiseStarted = true
+			if *daemonMode {
+				logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
+			}
 		}
 	}
 
@@ -1276,6 +1280,9 @@ func main() {
 	if !*daemonMode {
 		printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, false, extraVerbose)
 		printConfigLogs()
+		if advertiseStarted {
+			logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
+		}
 	}
 
 	// Start server in goroutine
@@ -2370,7 +2377,12 @@ func (w *wsDiscoveryService) startMetadataHTTP(bindIP string) error {
 		bodyXML := string(body)
 		action := xmlFieldValue(bodyXML, "Action")
 		messageID := xmlFieldValue(bodyXML, "MessageID")
-		logrus.Debugf("wsd metadata: method=%s remote=%s path=%s action=%s message_id=%s bytes=%d", r.Method, r.RemoteAddr, r.URL.Path, action, messageID, len(body))
+		host := r.RemoteAddr
+		if h, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && h != "" {
+			host = h
+		}
+		logrus.Debugf("network discovery: %s requested WSD metadata", host)
+		logrus.Tracef("wsd metadata: method=%s remote=%s path=%s action=%s message_id=%s bytes=%d", r.Method, r.RemoteAddr, r.URL.Path, action, messageID, len(body))
 		resp := w.metadataXML(messageID)
 		rw.Header().Set("Content-Type", `application/soap+xml; charset=utf-8; action="http://schemas.xmlsoap.org/ws/2004/09/transfer/GetResponse"`)
 		_, _ = io.WriteString(rw, resp)
