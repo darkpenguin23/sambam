@@ -1362,16 +1362,14 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 
 	if !extendedConnect {
 		fmt.Println("  Connect:")
-		if nonStdPort {
-			fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+firstShare)+" "+Dim("(SSH tunnel)"))
-			fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+firstShare)+" "+Dim("(SSH tunnel)"))
-		} else {
-			fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
-			fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
-		}
+		fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
+		fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
 		fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, authOpt, portOpt)))
 		if comboCount > 1 {
 			fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("(%d additional share/ip combinations; use -vv to show all)", comboCount-1)))
+		}
+		if nonStdPort {
+			fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("non-standard SMB port %s: Windows/macOS may require port forwarding", portNum)))
 		}
 	}
 
@@ -1379,53 +1377,33 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 		const contPrefix = "               "
 		fmt.Println("  All connections:")
 		fmt.Printf("  %-12s ", "Windows")
-		if nonStdPort {
-			for i, share := range shares {
+		first := true
+		for _, share := range shares {
+			for _, ip := range displayIPs {
 				prefix := contPrefix
-				if i == 0 {
+				if first {
 					prefix = ""
+					first = false
 				}
-				fmt.Printf("%s%s %s\n", prefix, Cyan("\\\\localhost\\"+share.Name), Dim("(SSH tunnel)"))
-			}
-		} else {
-			first := true
-			for _, share := range shares {
-				for _, ip := range displayIPs {
-					prefix := contPrefix
-					if first {
-						prefix = ""
-						first = false
-					}
-					fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
-				}
+				fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
 			}
 		}
 
 		fmt.Printf("  %-12s ", "macOS")
-		if nonStdPort {
-			for i, share := range shares {
+		first = true
+		for _, share := range shares {
+			for _, ip := range displayIPs {
 				prefix := contPrefix
-				if i == 0 {
+				if first {
 					prefix = ""
+					first = false
 				}
-				fmt.Printf("%s%s %s\n", prefix, Cyan("smb://localhost/"+share.Name), Dim("(SSH tunnel)"))
-			}
-		} else {
-			first := true
-			for _, share := range shares {
-				for _, ip := range displayIPs {
-					prefix := contPrefix
-					if first {
-						prefix = ""
-						first = false
-					}
-					fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
-				}
+				fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
 			}
 		}
 
 		fmt.Printf("  %-12s ", "Linux")
-		first := true
+		first = true
 		for _, share := range shares {
 			for _, ip := range displayIPs {
 				prefix := contPrefix

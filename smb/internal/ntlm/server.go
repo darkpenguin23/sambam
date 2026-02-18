@@ -29,6 +29,15 @@ type Server struct {
 	session *Session
 }
 
+func (s *Server) guestSession(flags uint32) *Session {
+	session := new(Session)
+	session.isClientSide = false
+	session.user = "guest"
+	session.negotiateFlags = flags
+	session.exportedSessionKey = make([]byte, 16)
+	return session
+}
+
 func NewServer(targetName, nbName, nbDomain, dnsName, dnsDomain string) *Server {
 	return &Server{
 		targetName: targetName,
@@ -256,15 +265,7 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		// For guest/anonymous access when user doesn't exist in our accounts,
 		// skip password validation entirely and allow as guest
 		if !userExists && s.allowGuest {
-			session := new(Session)
-			session.isClientSide = false
-			session.user = user
-			if user == "" {
-				session.user = "guest"
-			}
-			session.negotiateFlags = flags
-			session.exportedSessionKey = make([]byte, 16)
-			s.session = session
+			s.session = s.guestSession(flags)
 			return nil
 		}
 
@@ -283,6 +284,10 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 		targetInfo := ntlmv2ClientChallenge[28:]
 		encodeNtlmv2Response(expectedNtChallengeResponse, h, serverChallenge, clientChallenge, timeStamp, bytesEncoder(targetInfo))
 		if !bytes.Equal(ntChallengeResponse, expectedNtChallengeResponse) {
+			if s.allowGuest {
+				s.session = s.guestSession(flags)
+				return nil
+			}
 			return errors.New("login failure")
 		}
 
@@ -325,6 +330,10 @@ func (s *Server) Authenticate(amsg []byte) (err error) {
 				h.Write(s.cmsg)
 				h.Write(amsg)
 				if !bytes.Equal(MIC, h.Sum(nil)) {
+					if s.allowGuest {
+						s.session = s.guestSession(flags)
+						return nil
+					}
 					return errors.New("login failure")
 				}
 			}

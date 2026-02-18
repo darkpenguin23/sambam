@@ -1131,8 +1131,10 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		return c.sendPacket(rsp, nil, nil)
 	}
 
-	if ntlmAuth, ok := c.serverCtx.negotiator.Spnego.selectedMech.(*NTLMAuthenticator); ok {
-		c.observeNTLMInfo(ntlmAuth.infoMap())
+	if err == nil {
+		if ntlmAuth, ok := c.serverCtx.negotiator.Spnego.selectedMech.(*NTLMAuthenticator); ok {
+			c.observeNTLMInfo(ntlmAuth.infoMap())
+		}
 	}
 	c.ensureDefaultClientOS()
 	c.logClientProfile()

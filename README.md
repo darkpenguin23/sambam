@@ -271,10 +271,6 @@ CLI flags override all config values.
 
 ### Configuration Layout
 
-```bash
-sambam -n docs:/data/docs -u admin -p secret -r -G
-```
-
 ```toml
 listen = "0.0.0.0:445"
 # listen_addrs = ["@eth0:445", "10.23.22.13:445"]
