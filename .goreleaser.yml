@@ -21,8 +21,10 @@ builds:
       - arm
     goarm:
       - "6"
+    flags:
+      - -trimpath
     ldflags:
-      - -s -w -X main.version={{ .Version }}
+      - -s -w -buildid= -X main.version={{ .Version }}
 
   - id: sambam-cross
     main: ./
@@ -40,8 +42,10 @@ builds:
         goarch: amd64
       - goos: windows
         goarch: arm64
+    flags:
+      - -trimpath
     ldflags:
-      - -s -w -X main.version={{ .Version }}
+      - -s -w -buildid= -X main.version={{ .Version }}
 
 archives:
   - id: binaries
