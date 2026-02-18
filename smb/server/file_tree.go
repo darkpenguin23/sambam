@@ -1564,13 +1564,14 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 	// Many clients (including POSIX mounts) issue a trailing QUERY_DIRECTORY that
 	// only asks "are there more entries?". Skip that terminal call in debug logs.
 	if Status != uint32(STATUS_NO_MORE_FILES) {
+		c.infof("dir read: %s", dirTarget)
 		event := "dir list"
 		if r.Flags()&RESTART_SCANS != 0 {
 			event = "dir refresh"
 		}
 		key := fmt.Sprintf("%s|%s", event, dirTarget)
 		if shouldLogDirQueryDebug(key) {
-			log.Debugf("%s: %s", event, dirTarget)
+			c.debugf("%s: %s", event, dirTarget)
 		}
 	}
 

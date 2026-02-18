@@ -1050,10 +1050,6 @@ func main() {
 				path = normalizeLogPath(path)
 				logrus.Infof("open: %s (%s)", path, mode)
 			}
-			fs.OnDirRead = func(path string) {
-				path = normalizeLogPath(path)
-				logrus.Infof("dir read: %s", path)
-			}
 			fs.OnRead = func(path string) {
 				path = normalizeLogPath(path)
 				logrus.Infof("read: %s", path)
