@@ -35,6 +35,7 @@ type Share struct {
 // Config represents sambam configuration values loaded from rc files.
 type Config struct {
 	Listen       string            `toml:"listen"`
+	ListenAddrs  []string          `toml:"listen_addrs"`
 	Readonly     bool              `toml:"readonly"`
 	Verbose      bool              `toml:"verbose"`
 	VerboseLevel int               `toml:"verbose_level"`
@@ -74,6 +75,9 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	if md.IsDefined("listen") {
 		dst.Listen = src.Listen
+	}
+	if md.IsDefined("listen_addrs") {
+		dst.ListenAddrs = append([]string(nil), src.ListenAddrs...)
 	}
 	if md.IsDefined("readonly") {
 		dst.Readonly = src.Readonly
@@ -128,6 +132,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("listen") {
 		record("listen")
 	}
+	if md.IsDefined("listen_addrs") {
+		record("listen_addrs")
+	}
 	if md.IsDefined("readonly") {
 		record("readonly")
 	}
@@ -179,6 +186,8 @@ func configValueString(cfg *Config, key string) string {
 	switch key {
 	case "listen":
 		return cfg.Listen
+	case "listen_addrs":
+		return strings.Join(cfg.ListenAddrs, ",")
 	case "readonly":
 		return strconv.FormatBool(cfg.Readonly)
 	case "verbose":
@@ -352,7 +361,7 @@ func main() {
 
 	// CLI flags
 	shareSpecs := pflag.StringArrayP("name", "n", []string{}, "Share specification (name:path or just name)")
-	listenAddr := pflag.StringP("listen", "l", "0.0.0.0:445", "Address to listen on")
+	listenAddrs := pflag.StringArrayP("listen", "l", []string{}, "Address or @interface to listen on (repeatable)")
 	allowAddrs := pflag.StringArrayP("allow", "a", []string{}, "Allow client IP/CIDR (repeatable)")
 	readOnly := pflag.BoolP("readonly", "r", false, "Make share read-only")
 	showVersion := pflag.BoolP("version", "V", false, "Show version")
@@ -392,8 +401,12 @@ func main() {
 
 	// Apply config file values where CLI flags weren't explicitly set
 	if config != nil {
-		if !pflag.CommandLine.Changed("listen") && config.Listen != "" {
-			*listenAddr = config.Listen
+		if !pflag.CommandLine.Changed("listen") {
+			if len(config.ListenAddrs) > 0 {
+				*listenAddrs = append([]string(nil), config.ListenAddrs...)
+			} else if config.Listen != "" {
+				*listenAddrs = []string{config.Listen}
+			}
 		}
 		if !pflag.CommandLine.Changed("readonly") && config.Readonly {
 			*readOnly = true
@@ -435,6 +448,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error: password requires username. Use -u/--username together with -p/--password.")
 		os.Exit(1)
 	}
+	if len(*listenAddrs) == 0 {
+		*listenAddrs = []string{"0.0.0.0:445"}
+	}
 	allowNets, err := parseAllowedNetworks(*allowAddrs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Invalid allow rule: %v\n", err)
@@ -455,7 +471,13 @@ func main() {
 			}
 		}
 	}
-	effectiveConfig.Listen = *listenAddr
+	if len(*listenAddrs) == 1 {
+		effectiveConfig.Listen = (*listenAddrs)[0]
+		effectiveConfig.ListenAddrs = nil
+	} else {
+		effectiveConfig.Listen = (*listenAddrs)[0]
+		effectiveConfig.ListenAddrs = append([]string(nil), *listenAddrs...)
+	}
 	effectiveConfig.Readonly = *readOnly
 	effectiveConfig.HideDotfiles = *hideDotfiles
 	effectiveConfig.Username = *username
@@ -481,6 +503,9 @@ func main() {
 	markCLI := func(key string) { effectiveSrc[key] = "cli" }
 	if pflag.CommandLine.Changed("listen") {
 		markCLI("listen")
+		if len(*listenAddrs) > 1 {
+			markCLI("listen_addrs")
+		}
 	}
 	if pflag.CommandLine.Changed("readonly") {
 		markCLI("readonly")
@@ -520,13 +545,35 @@ func main() {
 		markCLI("logfile")
 	}
 
+	// Validate listen values (IP[:port] or @iface[:port]) before doing anything else.
+	for _, listenAddr := range *listenAddrs {
+		host, port := parseHostPort(listenAddr)
+		if strings.HasPrefix(host, "@") {
+			ifaceName := strings.TrimPrefix(host, "@")
+			if ifaceName == "" {
+				fmt.Fprintf(os.Stderr, "Invalid listen address %q: expected @<interface>[:port]\n", listenAddr)
+				os.Exit(1)
+			}
+		} else if host == "" || net.ParseIP(host) == nil {
+			fmt.Fprintf(os.Stderr, "Invalid listen address %q: expected IP, IP:port, or @<interface>[:port]\n", listenAddr)
+			os.Exit(1)
+		}
+		if port != "" {
+			p, err := strconv.Atoi(port)
+			if err != nil || p < 1 || p > 65535 {
+				fmt.Fprintf(os.Stderr, "Invalid listen port in %q: expected 1-65535\n", listenAddr)
+				os.Exit(1)
+			}
+		}
+	}
+
 	// Generate config and exit without starting the server.
 	if pflag.CommandLine.Changed("gen-config") {
 		target := *generateConfigPath
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddr, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *username, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, *readOnly, *verbose, *hideDotfiles, *username, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
@@ -573,23 +620,6 @@ func main() {
 		defer f.Close()
 		logrus.SetOutput(io.MultiWriter(os.Stdout, f))
 		log.SetOutput(io.MultiWriter(os.Stderr, f))
-	}
-
-	// When --listen is explicitly set on CLI, require a literal IP
-	// (with optional port) to avoid late DNS/listener failures.
-	if pflag.CommandLine.Changed("listen") {
-		host, port := parseHostPort(*listenAddr)
-		if host == "" || net.ParseIP(host) == nil {
-			fmt.Fprintf(os.Stderr, "Invalid listen address %q: expected IP or IP:port\n", *listenAddr)
-			os.Exit(1)
-		}
-		if port != "" {
-			p, err := strconv.Atoi(port)
-			if err != nil || p < 1 || p > 65535 {
-				fmt.Fprintf(os.Stderr, "Invalid listen port in %q: expected 1-65535\n", *listenAddr)
-				os.Exit(1)
-			}
-		}
 	}
 
 	extraVerbose := *verbose >= 2
@@ -732,6 +762,42 @@ func main() {
 		}
 	}
 
+	// Resolve listen addresses once and reuse across banner/listener.
+	listenEndpoints, listenPort, err := buildListenEndpoints(*listenAddrs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Invalid listen address: %v\n", err)
+		os.Exit(1)
+	}
+	listenDisplay := listenEndpoints[0].Display
+	if len(listenEndpoints) > 1 {
+		listenDisplay = fmt.Sprintf("%s %s", listenDisplay, Dim(fmt.Sprintf("(+%d more)", len(listenEndpoints)-1)))
+	}
+	bindAddrs := make([]string, 0, len(listenEndpoints))
+	for _, ep := range listenEndpoints {
+		bindAddrs = append(bindAddrs, ep.Bind)
+	}
+
+	// Get IPs for display.
+	var displayIPs []string
+	if len(listenEndpoints) == 1 && listenEndpoints[0].Wildcard {
+		displayIPs = getLocalIPs()
+	} else {
+		seen := map[string]struct{}{}
+		for _, ep := range listenEndpoints {
+			if _, ok := seen[ep.IP]; ok {
+				continue
+			}
+			seen[ep.IP] = struct{}{}
+			displayIPs = append(displayIPs, ep.IP)
+		}
+	}
+
+	// Format connection string with port if non-standard.
+	portSuffix := ""
+	if listenPort != "445" {
+		portSuffix = ":" + listenPort
+	}
+
 	// Handle daemon mode
 	if *daemonMode {
 		// Set log output to file if specified
@@ -769,22 +835,7 @@ func main() {
 		if child != nil {
 			// Parent process
 			// Show connection details even in daemon mode.
-			listenHost, listenPort := parseHostPort(*listenAddr)
-			if listenPort == "" {
-				listenPort = "445"
-			}
-			fullListenAddr := net.JoinHostPort(listenHost, listenPort)
-			var displayIPs []string
-			if listenHost == "0.0.0.0" || listenHost == "" {
-				displayIPs = getLocalIPs()
-			} else {
-				displayIPs = []string{listenHost}
-			}
-			portSuffix := ""
-			if listenPort != "445" {
-				portSuffix = ":" + listenPort
-			}
-			printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true, extraVerbose)
+			printBanner(shares, *readOnly, listenDisplay, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, true, extraVerbose)
 			printConfigLogs()
 
 			fmt.Println()
@@ -937,36 +988,15 @@ func main() {
 		vfsShares,
 	)
 
-	// Parse listen address and add default port if needed
-	listenHost, listenPort := parseHostPort(*listenAddr)
-	if listenPort == "" {
-		listenPort = "445"
-	}
-	fullListenAddr := net.JoinHostPort(listenHost, listenPort)
-
-	// Get IPs for display
-	var displayIPs []string
-	if listenHost == "0.0.0.0" || listenHost == "" {
-		displayIPs = getLocalIPs()
-	} else {
-		displayIPs = []string{listenHost}
-	}
-
-	// Format connection string with port if non-standard
-	portSuffix := ""
-	if listenPort != "445" {
-		portSuffix = ":" + listenPort
-	}
-
 	// Print banner in foreground mode.
 	if !*daemonMode {
-		printBanner(shares, *readOnly, fullListenAddr, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false, extraVerbose)
+		printBanner(shares, *readOnly, listenDisplay, displayIPs, portSuffix, *allowAddrs, *username, actualPassword, *expireStr, false, extraVerbose)
 		printConfigLogs()
 	}
 
 	// Start server in goroutine
 	go func() {
-		if err := srv.Serve(fullListenAddr); err != nil {
+		if err := srv.ServeMany(bindAddrs); err != nil {
 			if *daemonMode && *logFile != "" {
 				log.Printf("Server error: %v", err)
 			} else if !*daemonMode {
@@ -1095,8 +1125,8 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 				maxLen = len(share.Name)
 			}
 		}
-		if maxLen < 12 {
-			maxLen = 12
+		if maxLen < 11 {
+			maxLen = 11
 		}
 		fmt.Printf("  %s\n", "Shares:")
 		for _, share := range shares {
@@ -1145,14 +1175,6 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	comboCount := len(displayIPs) * len(shares)
 
 	fmt.Println()
-	fmt.Println("  Connect:")
-	if nonStdPort {
-		fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+firstShare)+" "+Dim("(SSH tunnel)"))
-		fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+firstShare)+" "+Dim("(SSH tunnel)"))
-	} else {
-		fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
-		fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
-	}
 	authOpt := "guest"
 	if username != "" {
 		authOpt = "username=" + username + ",password=" + password
@@ -1161,42 +1183,90 @@ func printBanner(shares []Share, readOnly bool, listenAddr string, displayIPs []
 	if nonStdPort {
 		portOpt = ",port=" + portNum
 	}
-	fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, authOpt, portOpt)))
-	if comboCount > 1 && !extendedConnect {
-		fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("(%d additional share/ip combinations; use -vv to show all)", comboCount-1)))
+
+	if !extendedConnect {
+		fmt.Println("  Connect:")
+		if nonStdPort {
+			fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+firstShare)+" "+Dim("(SSH tunnel)"))
+			fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+firstShare)+" "+Dim("(SSH tunnel)"))
+		} else {
+			fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
+			fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
+		}
+		fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, authOpt, portOpt)))
+		if comboCount > 1 {
+			fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("(%d additional share/ip combinations; use -vv to show all)", comboCount-1)))
+		}
 	}
 
 	if extendedConnect {
-		fmt.Printf("  %-12s %s %s\n", "", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s,vers=3.1.1,posix,cifsacl", firstIP, firstShare, authOpt, portOpt)), Dim("# POSIX"))
+		const contPrefix = "               "
+		fmt.Println("  All connections:")
+		fmt.Printf("  %-12s ", "Windows")
+		if nonStdPort {
+			for i, share := range shares {
+				prefix := contPrefix
+				if i == 0 {
+					prefix = ""
+				}
+				fmt.Printf("%s%s %s\n", prefix, Cyan("\\\\localhost\\"+share.Name), Dim("(SSH tunnel)"))
+			}
+		} else {
+			first := true
+			for _, share := range shares {
+				for _, ip := range displayIPs {
+					prefix := contPrefix
+					if first {
+						prefix = ""
+						first = false
+					}
+					fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
+				}
+			}
+		}
+
+		fmt.Printf("  %-12s ", "macOS")
+		if nonStdPort {
+			for i, share := range shares {
+				prefix := contPrefix
+				if i == 0 {
+					prefix = ""
+				}
+				fmt.Printf("%s%s %s\n", prefix, Cyan("smb://localhost/"+share.Name), Dim("(SSH tunnel)"))
+			}
+		} else {
+			first := true
+			for _, share := range shares {
+				for _, ip := range displayIPs {
+					prefix := contPrefix
+					if first {
+						prefix = ""
+						first = false
+					}
+					fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
+				}
+			}
+		}
+
+		fmt.Printf("  %-12s ", "Linux")
+		first := true
+		for _, share := range shares {
+			for _, ip := range displayIPs {
+				prefix := contPrefix
+				if first {
+					prefix = ""
+					first = false
+				}
+				fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", ip, share.Name, authOpt, portOpt)))
+				fmt.Printf("%s%s %s\n", contPrefix, Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s,vers=3.1.1,posix,cifsacl", ip, share.Name, authOpt, portOpt)), Dim("# POSIX"))
+			}
+		}
 
 		if nonStdPort {
 			fmt.Println()
 			fmt.Println("  SSH tunnel:")
 			for _, ip := range displayIPs {
 				fmt.Printf("    %s\n", Cyan(fmt.Sprintf("ssh -L 445:%s:%s user@%s", ip, portNum, ip)))
-			}
-		}
-
-		if comboCount > 1 {
-			fmt.Println()
-			fmt.Println("  All endpoints:")
-			if nonStdPort {
-				for _, share := range shares {
-					fmt.Printf("  %-12s %s\n", "Windows", Cyan("\\\\localhost\\"+share.Name)+" "+Dim("(SSH tunnel)"))
-					fmt.Printf("  %-12s %s\n", "macOS", Cyan("smb://localhost/"+share.Name)+" "+Dim("(SSH tunnel)"))
-				}
-			} else {
-				for _, share := range shares {
-					for _, ip := range displayIPs {
-						fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", ip, share.Name)))
-						fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", ip, share.Name)))
-					}
-				}
-			}
-			for _, share := range shares {
-				for _, ip := range displayIPs {
-					fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", ip, share.Name, authOpt, portOpt)))
-				}
 			}
 		}
 	}
@@ -1234,7 +1304,7 @@ func printUsage() {
 	}
 
 	printOpt("-n, --name", "Share name or name:path "+Dim("(repeatable)"))
-	printOpt("-l, --listen", "Address to listen on "+Dim("(default: 0.0.0.0:445)"))
+	printOpt("-l, --listen", "Address or @interface to listen on "+Dim("(repeatable, default: 0.0.0.0:445)"))
 	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
 	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-u, --username", "Require authentication")
@@ -1288,7 +1358,7 @@ func normalizeCLIArgs(args []string) []string {
 	return out
 }
 
-func writeGeneratedConfig(target, listen string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, username, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
+func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []string, readOnly bool, verbose int, hideDotfiles bool, username, password, expire, pidFile, logFile string, shareSpecs []string, args []string) ([]string, error) {
 	var b bytes.Buffer
 	written := []string{}
 	b.WriteString("# sambam generated configuration\n")
@@ -1316,7 +1386,13 @@ func writeGeneratedConfig(target, listen string, allowAddrs []string, readOnly b
 	}
 
 	if pflag.CommandLine.Changed("listen") {
-		writeString("listen", listen)
+		if len(listenAddrs) <= 1 {
+			if len(listenAddrs) == 1 {
+				writeString("listen", listenAddrs[0])
+			}
+		} else {
+			writeStringArray("listen_addrs", listenAddrs)
+		}
 	}
 	if pflag.CommandLine.Changed("allow") {
 		writeStringArray("allow", allowAddrs)
@@ -1427,6 +1503,137 @@ func parseHostPort(addr string) (host, port string) {
 		return addr, ""
 	}
 	return host, port
+}
+
+type listenEndpoint struct {
+	Bind     string
+	Display  string
+	IP       string
+	Port     string
+	Wildcard bool
+}
+
+func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
+	endpoints := make([]listenEndpoint, 0, len(values))
+	seen := map[string]struct{}{}
+	commonPort := ""
+	wildcardByPort := map[string]bool{}
+	nonWildcardByPort := map[string]bool{}
+
+	for _, raw := range values {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			return nil, "", fmt.Errorf("empty listen value")
+		}
+
+		host, port := parseHostPort(v)
+		if port == "" {
+			port = "445"
+		}
+		if commonPort == "" {
+			commonPort = port
+		} else if commonPort != port {
+			return nil, "", fmt.Errorf("all listen endpoints must use the same port (got %s and %s)", commonPort, port)
+		}
+
+		resolvedHost, iface, err := resolveListenHost(host)
+		if err != nil {
+			return nil, "", fmt.Errorf("%q: %w", raw, err)
+		}
+		if resolvedHost == "" || net.ParseIP(resolvedHost) == nil {
+			return nil, "", fmt.Errorf("%q: resolved host is not a valid IP", raw)
+		}
+
+		bind := net.JoinHostPort(resolvedHost, port)
+		if _, ok := seen[bind]; ok {
+			continue
+		}
+		seen[bind] = struct{}{}
+
+		wildcard := resolvedHost == "0.0.0.0" || resolvedHost == "::"
+		if wildcard {
+			wildcardByPort[port] = true
+			if nonWildcardByPort[port] {
+				return nil, "", fmt.Errorf("cannot mix wildcard %q with specific listen endpoints on port %s", raw, port)
+			}
+		} else {
+			nonWildcardByPort[port] = true
+			if wildcardByPort[port] {
+				return nil, "", fmt.Errorf("cannot mix wildcard and specific listen endpoints on port %s", port)
+			}
+		}
+
+		display := bind
+		if iface != "" {
+			display = fmt.Sprintf("%s %s", bind, Dim(fmt.Sprintf("(from @%s)", iface)))
+		}
+		endpoints = append(endpoints, listenEndpoint{
+			Bind:     bind,
+			Display:  display,
+			IP:       resolvedHost,
+			Port:     port,
+			Wildcard: wildcard,
+		})
+	}
+
+	if len(endpoints) == 0 {
+		return nil, "", fmt.Errorf("no listen endpoints configured")
+	}
+	return endpoints, commonPort, nil
+}
+
+func resolveListenHost(host string) (resolvedHost string, iface string, err error) {
+	if !strings.HasPrefix(host, "@") {
+		return host, "", nil
+	}
+
+	iface = strings.TrimPrefix(host, "@")
+	if iface == "" {
+		return "", "", fmt.Errorf("expected @<interface>")
+	}
+
+	netIf, err := net.InterfaceByName(iface)
+	if err != nil {
+		return "", "", fmt.Errorf("interface %q not found", iface)
+	}
+	addrs, err := netIf.Addrs()
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read addresses for interface %q: %w", iface, err)
+	}
+
+	// Prefer non-loopback IPv4 for predictable endpoint display.
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		if ip4 := ip.To4(); ip4 != nil {
+			return ip4.String(), iface, nil
+		}
+	}
+
+	// Fallback: first non-loopback IPv6.
+	for _, addr := range addrs {
+		var ip net.IP
+		switch v := addr.(type) {
+		case *net.IPNet:
+			ip = v.IP
+		case *net.IPAddr:
+			ip = v.IP
+		}
+		if ip == nil || ip.IsLoopback() || ip.To16() == nil || ip.To4() != nil {
+			continue
+		}
+		return ip.String(), iface, nil
+	}
+
+	return "", "", fmt.Errorf("interface %q has no usable IP address", iface)
 }
 
 func parseAllowedNetworks(values []string) ([]*net.IPNet, error) {

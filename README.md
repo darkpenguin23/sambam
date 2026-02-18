@@ -90,10 +90,14 @@ sudo sambam -n docs:/home/user/documents -n pics:/home/user/photos
 
 ### `-l, --listen <address>`
 
-Address and port to listen on. Default: `0.0.0.0:445`. Use a non-standard port if 445 is already in use.
+Address and port to listen on. Default: `0.0.0.0:445`.  
+You can also bind by interface with `@<name>` (optionally with port), for example `@eth0` or `@eth0:445`.
+Repeat the flag to bind multiple endpoints.
 
 ```bash
 sudo sambam -l 0.0.0.0:8445 /data
+sudo sambam -l @eth0:445 /data
+sudo sambam -l @eth0 -l 10.23.22.13:445 /data
 ```
 
 ### `-a, --allow <ip-or-cidr>`
@@ -245,8 +249,10 @@ Result: `listen` comes from user config, `readonly` comes from local config.
 Example configuration file (TOML):
 
 ```toml
-# Listen address
+# Listen address (IP:port or @interface[:port])
 listen = "0.0.0.0:445"
+# listen = "@eth0:445"
+# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
 
 # Allowlist clients (optional)
 # allow = ["192.168.1.10", "192.168.2.0/24"]

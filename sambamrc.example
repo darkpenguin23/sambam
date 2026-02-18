@@ -3,7 +3,10 @@
 # CLI flags override these settings.
 
 # Listen address (default: 0.0.0.0:445)
+# Supports IP:port or @interface[:port], e.g. "@eth0:445"
 listen = "0.0.0.0:445"
+# Optional multi-listener variant:
+# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
 
 # Allowlist clients (optional)
 # allow = ["192.168.1.10", "192.168.2.0/24"]

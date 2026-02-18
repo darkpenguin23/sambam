@@ -36,8 +36,8 @@ type Server struct {
 	serverStartTime time.Time
 	serverGuid      Guid
 
-	listener net.Listener
-	active   bool
+	listeners []net.Listener
+	active    bool
 
 	shares     map[string]vfs.VFSFileSystem
 	origShares map[string]vfs.VFSFileSystem
@@ -216,6 +216,13 @@ func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFile
 }
 
 func (d *Server) Serve(addr string) error {
+	return d.ServeMany([]string{addr})
+}
+
+func (d *Server) ServeMany(addrs []string) error {
+	if len(addrs) == 0 {
+		return fmt.Errorf("no listen addresses provided")
+	}
 
 	_, err := rand.Read(d.serverGuid[:])
 	if err != nil {
@@ -225,23 +232,49 @@ func (d *Server) Serve(addr string) error {
 	rand.Read(SRVSVC_GUID.Persistent[:])
 	rand.Read(SRVSVC_GUID.Volatile[:])
 
-	// Listen on TCP port 8080 on all available interfaces.
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
+	listeners := make([]net.Listener, 0, len(addrs))
+	for _, addr := range addrs {
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			for _, opened := range listeners {
+				_ = opened.Close()
+			}
+			return err
+		}
+		listeners = append(listeners, listener)
 	}
-	d.listener = listener
-	defer listener.Close()
+	d.listeners = listeners
+	defer func() {
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+	}()
 	d.active = true
 
 	if d.fsWatcher != nil {
 		d.startFsWatcher()
 	}
 
+	var wg sync.WaitGroup
+	for _, listener := range listeners {
+		wg.Add(1)
+		go func(listener net.Listener) {
+			defer wg.Done()
+			d.serveListener(listener)
+		}(listener)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (d *Server) serveListener(listener net.Listener) {
 	for d.active {
 		// Accept a new connection.
 		c, err := listener.Accept()
 		if err != nil {
+			if !d.active {
+				return
+			}
 			continue
 		}
 
@@ -287,7 +320,9 @@ func (d *Server) Serve(addr string) error {
 			treeMapById:         make(map[uint32]treeOps),
 		}
 
+		d.lock.Lock()
 		d.activeConns[conn] = struct{}{}
+		d.lock.Unlock()
 		go conn.runReciever()
 		go conn.runSender()
 
@@ -310,16 +345,23 @@ func (d *Server) Serve(addr string) error {
 			go run()
 		}
 	}
-	return nil
 }
 
 func (d *Server) Shutdown() {
 	d.active = false
-	d.listener.Close()
-	if d.fsWatcher != nil {
-		d.fsWatcher.Close()
+	for _, l := range d.listeners {
+		_ = l.Close()
 	}
+	if d.fsWatcher != nil {
+		_ = d.fsWatcher.Close()
+	}
+	d.lock.Lock()
+	conns := make([]*conn, 0, len(d.activeConns))
 	for c := range d.activeConns {
+		conns = append(conns, c)
+	}
+	d.lock.Unlock()
+	for _, c := range conns {
 		c.shutdown()
 	}
 }
