@@ -86,25 +86,24 @@ run_expect_ok "unit tests" bash -lc "cd '${ROOT_DIR}' && GOCACHE='${TMP_BASE}/go
 cat >"${TMP_BASE}/legacy-user.toml" <<'EOF'
 username = "admin"
 password = "secret"
-[shares.docs]
+[share.docs]
 path = "/tmp"
 EOF
-run_expect_fail_contains "reject legacy username/password" "legacy config keys username/password are no longer supported" \
+run_expect_fail_contains "reject legacy username/password" "legacy key \"username\" is no longer supported" \
   "${BIN}" -c "${TMP_BASE}/legacy-user.toml"
 
 cat >"${TMP_BASE}/legacy-shares.toml" <<'EOF'
 [shares]
 docs = "/tmp"
 EOF
-run_expect_fail_contains "reject legacy [shares] shorthand" "expected table [shares.docs]" \
+run_expect_fail_contains "reject legacy [shares] shorthand" "legacy key \"shares\" is no longer supported" \
   "${BIN}" -c "${TMP_BASE}/legacy-shares.toml"
 
 cat >"${TMP_BASE}/policy-conflict.toml" <<'EOF'
-[[users]]
-name = "test"
+[user.test]
 password = "secret"
 
-[shares.docs]
+[share.docs]
 path = "/tmp"
 guest = true
 allow_users = ["test"]
@@ -131,15 +130,17 @@ else
 fi
 
 cat >"${TMP_BASE}/explicit-only.toml" <<'EOF'
+[global]
 listen = "127.0.0.1:14445"
-[shares.docs]
+[share.docs]
 path = "/tmp"
 guest = true
 EOF
 mkdir -p "${TMP_BASE}/work"
 cat >"${TMP_BASE}/work/.sambamrc" <<'EOF'
+[global]
 listen = "127.0.0.1:15555"
-[shares.bad]
+[share.bad]
 path = "/var"
 guest = true
 EOF
@@ -196,8 +197,9 @@ else
   CFG_FILE="${TMP_BASE}/mount-check.toml"
   LOG_FILE="${TMP_BASE}/mount-check.log"
   cat > "${CFG_FILE}" <<EOF
+[global]
 listen = "127.0.0.1:14446"
-[shares.smoke]
+[share.smoke]
 path = "${SRC_DIR}"
 guest = true
 EOF
@@ -286,9 +288,10 @@ EOF
   RO_CFG_FILE="${TMP_BASE}/mount-ro-check.toml"
   RO_LOG_FILE="${TMP_BASE}/mount-ro-check.log"
   cat > "${RO_CFG_FILE}" <<EOF
+[global]
 listen = "127.0.0.1:14447"
 readonly = true
-[shares.smoke]
+[share.smoke]
 path = "${SRC_DIR}"
 guest = true
 EOF
@@ -317,11 +320,11 @@ EOF
   AUTH_CFG_FILE="${TMP_BASE}/mount-auth-check.toml"
   AUTH_LOG_FILE="${TMP_BASE}/mount-auth-check.log"
   cat > "${AUTH_CFG_FILE}" <<EOF
+[global]
 listen = "127.0.0.1:14448"
-[[users]]
-name = "smokeuser"
+[user.smokeuser]
 password = "smokepass"
-[shares.smoke]
+[share.smoke]
 path = "${SRC_DIR}"
 allow_users = ["smokeuser"]
 EOF

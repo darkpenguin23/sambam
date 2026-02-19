@@ -2,14 +2,12 @@
 # Place this file at /etc/sambamrc, ~/.sambamrc, or ./.sambamrc
 # CLI flags override these settings.
 
-# Listen address (single endpoint)
+[global]
+# Listen endpoints (single string or array).
 listen = "0.0.0.0:445"
+# listen = ["@eth0:445", "10.23.22.13:445"]
 
-# Listen addresses (multi-endpoint variant; use instead of listen)
-# Supports IP:port or @interface[:port], e.g. "@eth0:445"
-# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
-
-# Allowlist clients (IP or CIDR)
+# Allowlist clients (single IP/CIDR string or array).
 allow = ["10.23.0.0/16"]
 
 # Advertise SMB share via mDNS (_smb._tcp) + WS-Discovery
@@ -34,28 +32,26 @@ pidfile = "/tmp/sambam.pid"
 logfile = "/tmp/sambam.log"
 
 # Users
-[[users]]
-name = "alice"
+[user.alice]
 password = "secret1"
 readonly = false
 
-[[users]]
-name = "bob"
+[user.bob]
 password = "secret2"
 readonly = true
 
 # Shares
-[shares.docs]
+[share.docs]
 path = "/tmp/docs"
 allow_users = ["alice", "bob"]
 readonly = false
 
-[shares.private]
+[share.private]
 path = "/tmp/private"
 allow_users = ["alice"]
 readonly = true
 
-[shares.public]
+[share.public]
 path = "/tmp/public"
 guest = true
 readonly = false

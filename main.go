@@ -63,23 +63,29 @@ type UserConfig struct {
 	Readonly bool   `toml:"readonly"`
 }
 
+type userFieldMask struct {
+	Password bool
+	Readonly bool
+}
+
 // Config represents sambam configuration values loaded from rc files.
 type Config struct {
-	Listen       string       `toml:"listen"`
-	ListenAddrs  []string     `toml:"listen_addrs"`
-	Advertise    bool         `toml:"advertise"`
-	Readonly     bool         `toml:"readonly"`
-	Verbose      bool         `toml:"verbose"`
-	VerboseLevel int          `toml:"verbose_level"`
-	Debug        bool         `toml:"debug"` // backward compatibility: maps to verbose_level=3
-	Trace        bool         `toml:"trace"`
-	Allow        []string     `toml:"allow"`
-	HideDotfiles bool         `toml:"hide_dotfiles"`
-	Users        []UserConfig `toml:"users"`
-	Expire       string       `toml:"expire"`
-	PidFile      string       `toml:"pidfile"`
-	LogFile      string       `toml:"logfile"`
+	Listen       string
+	ListenAddrs  []string
+	Advertise    bool
+	Readonly     bool
+	Verbose      bool
+	VerboseLevel int
+	Debug        bool // backward compatibility: maps to verbose_level=3
+	Trace        bool
+	Allow        []string
+	HideDotfiles bool
+	Users        []UserConfig
+	Expire       string
+	PidFile      string
+	LogFile      string
 	Shares       map[string]ShareConfig
+	userMask     map[string]userFieldMask
 	shareMask    map[string]shareFieldMask
 }
 
@@ -145,21 +151,9 @@ type wsDiscoveryService struct {
 
 func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	type rawConfig struct {
-		Listen       string                    `toml:"listen"`
-		ListenAddrs  []string                  `toml:"listen_addrs"`
-		Advertise    bool                      `toml:"advertise"`
-		Readonly     bool                      `toml:"readonly"`
-		Verbose      bool                      `toml:"verbose"`
-		VerboseLevel int                       `toml:"verbose_level"`
-		Debug        bool                      `toml:"debug"`
-		Trace        bool                      `toml:"trace"`
-		Allow        []string                  `toml:"allow"`
-		HideDotfiles bool                      `toml:"hide_dotfiles"`
-		Users        []toml.Primitive          `toml:"users"`
-		Expire       string                    `toml:"expire"`
-		PidFile      string                    `toml:"pidfile"`
-		LogFile      string                    `toml:"logfile"`
-		Shares       map[string]toml.Primitive `toml:"shares"`
+		Global toml.Primitive            `toml:"global"`
+		User   map[string]toml.Primitive `toml:"user"`
+		Share  map[string]toml.Primitive `toml:"share"`
 	}
 
 	var raw rawConfig
@@ -167,36 +161,120 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	if err != nil {
 		return nil, md, err
 	}
-	if md.IsDefined("username") || md.IsDefined("password") {
-		return nil, md, fmt.Errorf("legacy config keys username/password are no longer supported; use [[users]] entries")
+
+	legacyRoots := []string{
+		"listen", "listen_addrs", "allow", "advertise", "readonly",
+		"verbose", "verbose_level", "debug", "trace", "hide_dotfiles",
+		"expire", "pidfile", "logfile", "users", "shares", "username", "password",
 	}
-	cfg := &Config{
-		Listen:       raw.Listen,
-		ListenAddrs:  append([]string(nil), raw.ListenAddrs...),
-		Advertise:    raw.Advertise,
-		Readonly:     raw.Readonly,
-		Verbose:      raw.Verbose,
-		VerboseLevel: raw.VerboseLevel,
-		Debug:        raw.Debug,
-		Trace:        raw.Trace,
-		Allow:        append([]string(nil), raw.Allow...),
-		HideDotfiles: raw.HideDotfiles,
-		Users:        []UserConfig{},
-		Expire:       raw.Expire,
-		PidFile:      raw.PidFile,
-		LogFile:      raw.LogFile,
-		Shares:       map[string]ShareConfig{},
-		shareMask:    map[string]shareFieldMask{},
+	for _, k := range legacyRoots {
+		if md.IsDefined(k) {
+			return nil, md, fmt.Errorf("legacy key %q is no longer supported; use [global], [user.<name>], and [share.<name>]", k)
+		}
 	}
 
-	for name, prim := range raw.Shares {
+	cfg := &Config{
+		Users:     []UserConfig{},
+		Shares:    map[string]ShareConfig{},
+		userMask:  map[string]userFieldMask{},
+		shareMask: map[string]shareFieldMask{},
+	}
+
+	parseStringOrArray := func(v interface{}, key string) ([]string, error) {
+		switch vv := v.(type) {
+		case string:
+			if strings.TrimSpace(vv) == "" {
+				return nil, fmt.Errorf("%s must not be empty", key)
+			}
+			return []string{vv}, nil
+		case []interface{}:
+			out := make([]string, 0, len(vv))
+			for i, item := range vv {
+				s, ok := item.(string)
+				if !ok {
+					return nil, fmt.Errorf("%s[%d] must be a string", key, i)
+				}
+				if strings.TrimSpace(s) == "" {
+					return nil, fmt.Errorf("%s[%d] must not be empty", key, i)
+				}
+				out = append(out, s)
+			}
+			return out, nil
+		case []string:
+			out := make([]string, 0, len(vv))
+			for i, s := range vv {
+				if strings.TrimSpace(s) == "" {
+					return nil, fmt.Errorf("%s[%d] must not be empty", key, i)
+				}
+				out = append(out, s)
+			}
+			return out, nil
+		default:
+			return nil, fmt.Errorf("%s must be a string or array of strings", key)
+		}
+	}
+
+	if md.IsDefined("global") {
+		var gmap map[string]interface{}
+		if err := md.PrimitiveDecode(raw.Global, &gmap); err != nil {
+			return nil, md, fmt.Errorf("invalid [global] section")
+		}
+		type globalConfig struct {
+			Advertise    bool   `toml:"advertise"`
+			Readonly     bool   `toml:"readonly"`
+			Verbose      bool   `toml:"verbose"`
+			VerboseLevel int    `toml:"verbose_level"`
+			Debug        bool   `toml:"debug"`
+			Trace        bool   `toml:"trace"`
+			HideDotfiles bool   `toml:"hide_dotfiles"`
+			Expire       string `toml:"expire"`
+			PidFile      string `toml:"pidfile"`
+			LogFile      string `toml:"logfile"`
+		}
+		var gcfg globalConfig
+		if err := md.PrimitiveDecode(raw.Global, &gcfg); err != nil {
+			return nil, md, fmt.Errorf("invalid [global] section")
+		}
+		cfg.Advertise = gcfg.Advertise
+		cfg.Readonly = gcfg.Readonly
+		cfg.Verbose = gcfg.Verbose
+		cfg.VerboseLevel = gcfg.VerboseLevel
+		cfg.Debug = gcfg.Debug
+		cfg.Trace = gcfg.Trace
+		cfg.HideDotfiles = gcfg.HideDotfiles
+		cfg.Expire = gcfg.Expire
+		cfg.PidFile = gcfg.PidFile
+		cfg.LogFile = gcfg.LogFile
+		if rawListen, ok := gmap["listen"]; ok {
+			listenVals, err := parseStringOrArray(rawListen, "global.listen")
+			if err != nil {
+				return nil, md, err
+			}
+			if len(listenVals) == 1 {
+				cfg.Listen = listenVals[0]
+				cfg.ListenAddrs = nil
+			} else {
+				cfg.Listen = listenVals[0]
+				cfg.ListenAddrs = append([]string(nil), listenVals...)
+			}
+		}
+		if rawAllow, ok := gmap["allow"]; ok {
+			allowVals, err := parseStringOrArray(rawAllow, "global.allow")
+			if err != nil {
+				return nil, md, err
+			}
+			cfg.Allow = append([]string(nil), allowVals...)
+		}
+	}
+
+	for name, prim := range raw.Share {
 		var rawShare map[string]interface{}
 		if err := md.PrimitiveDecode(prim, &rawShare); err != nil {
-			return nil, md, fmt.Errorf("invalid shares.%s: expected table [shares.%s], legacy string form is no longer supported", name, name)
+			return nil, md, fmt.Errorf("invalid share.%s table", name)
 		}
 		var share ShareConfig
 		if err := md.PrimitiveDecode(prim, &share); err != nil {
-			return nil, md, fmt.Errorf("invalid shares.%s: expected table [shares.%s]", name, name)
+			return nil, md, fmt.Errorf("invalid share.%s table", name)
 		}
 		cfg.Shares[name] = share
 		mask := shareFieldMask{}
@@ -214,65 +292,120 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		}
 		cfg.shareMask[name] = mask
 	}
-	for i, prim := range raw.Users {
+
+	for name, prim := range raw.User {
 		var rawUser map[string]interface{}
 		if err := md.PrimitiveDecode(prim, &rawUser); err != nil {
-			return nil, md, fmt.Errorf("invalid users[%d]: expected table [[users]]", i)
+			return nil, md, fmt.Errorf("invalid user.%s table", name)
 		}
-		var user UserConfig
-		if err := md.PrimitiveDecode(prim, &user); err != nil {
-			return nil, md, fmt.Errorf("invalid users[%d]: expected table [[users]]", i)
+		type userTable struct {
+			Name     string `toml:"name"`
+			Password string `toml:"password"`
+			Readonly bool   `toml:"readonly"`
 		}
-		cfg.Users = append(cfg.Users, user)
+		var ut userTable
+		if err := md.PrimitiveDecode(prim, &ut); err != nil {
+			return nil, md, fmt.Errorf("invalid user.%s table", name)
+		}
+		if strings.TrimSpace(ut.Name) != "" {
+			return nil, md, fmt.Errorf("user.%s must not define name; the table key is the username", name)
+		}
+		cfg.Users = append(cfg.Users, UserConfig{
+			Name:     name,
+			Password: ut.Password,
+			Readonly: ut.Readonly,
+		})
+		um := userFieldMask{}
+		if _, ok := rawUser["password"]; ok {
+			um.Password = true
+		}
+		if _, ok := rawUser["readonly"]; ok {
+			um.Readonly = true
+		}
+		cfg.userMask[name] = um
 	}
+	sort.Slice(cfg.Users, func(i, j int) bool {
+		return strings.ToLower(cfg.Users[i].Name) < strings.ToLower(cfg.Users[j].Name)
+	})
 
 	return cfg, md, nil
 }
 
 func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
-	if md.IsDefined("listen") {
+	if md.IsDefined("global", "listen") {
 		dst.Listen = src.Listen
-	}
-	if md.IsDefined("listen_addrs") {
 		dst.ListenAddrs = append([]string(nil), src.ListenAddrs...)
 	}
-	if md.IsDefined("advertise") {
+	if md.IsDefined("global", "advertise") {
 		dst.Advertise = src.Advertise
 	}
-	if md.IsDefined("readonly") {
+	if md.IsDefined("global", "readonly") {
 		dst.Readonly = src.Readonly
 	}
-	if md.IsDefined("verbose") {
+	if md.IsDefined("global", "verbose") {
 		dst.Verbose = src.Verbose
 	}
-	if md.IsDefined("verbose_level") {
+	if md.IsDefined("global", "verbose_level") {
 		dst.VerboseLevel = src.VerboseLevel
 	}
-	if md.IsDefined("debug") {
+	if md.IsDefined("global", "debug") {
 		dst.Debug = src.Debug
 	}
-	if md.IsDefined("trace") {
+	if md.IsDefined("global", "trace") {
 		dst.Trace = src.Trace
 	}
-	if md.IsDefined("allow") {
+	if md.IsDefined("global", "allow") {
 		dst.Allow = append([]string(nil), src.Allow...)
 	}
-	if md.IsDefined("hide_dotfiles") {
+	if md.IsDefined("global", "hide_dotfiles") {
 		dst.HideDotfiles = src.HideDotfiles
 	}
-	if md.IsDefined("users") {
-		dst.Users = append([]UserConfig(nil), src.Users...)
-	}
-	if md.IsDefined("expire") {
+	if md.IsDefined("global", "expire") {
 		dst.Expire = src.Expire
 	}
-	if md.IsDefined("pidfile") {
+	if md.IsDefined("global", "pidfile") {
 		dst.PidFile = src.PidFile
 	}
-	if md.IsDefined("logfile") {
+	if md.IsDefined("global", "logfile") {
 		dst.LogFile = src.LogFile
 	}
-	if md.IsDefined("shares") {
+	if md.IsDefined("user") {
+		if dst.userMask == nil {
+			dst.userMask = map[string]userFieldMask{}
+		}
+		existing := map[string]UserConfig{}
+		for _, u := range dst.Users {
+			existing[strings.ToLower(u.Name)] = u
+		}
+		for _, user := range src.Users {
+			key := strings.ToLower(user.Name)
+			mask := src.userMask[user.Name]
+			cur := existing[key]
+			if cur.Name == "" {
+				cur.Name = user.Name
+			}
+			if mask.Password {
+				cur.Password = user.Password
+			}
+			if mask.Readonly {
+				cur.Readonly = user.Readonly
+			}
+			existing[key] = cur
+			dstMask := dst.userMask[cur.Name]
+			dstMask.Password = dstMask.Password || mask.Password
+			dstMask.Readonly = dstMask.Readonly || mask.Readonly
+			dst.userMask[cur.Name] = dstMask
+		}
+		users := make([]UserConfig, 0, len(existing))
+		for _, u := range existing {
+			users = append(users, u)
+		}
+		sort.Slice(users, func(i, j int) bool {
+			return strings.ToLower(users[i].Name) < strings.ToLower(users[j].Name)
+		})
+		dst.Users = users
+	}
+	if md.IsDefined("share") {
 		if dst.Shares == nil {
 			dst.Shares = map[string]ShareConfig{}
 		}
@@ -309,63 +442,69 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	record := func(key string) {
 		info.SettingSrc[key] = src
 	}
-	if md.IsDefined("listen") {
+	if md.IsDefined("global", "listen") {
 		record("listen")
 	}
-	if md.IsDefined("listen_addrs") {
-		record("listen_addrs")
-	}
-	if md.IsDefined("advertise") {
+	if md.IsDefined("global", "advertise") {
 		record("advertise")
 	}
-	if md.IsDefined("readonly") {
+	if md.IsDefined("global", "readonly") {
 		record("readonly")
 	}
-	if md.IsDefined("verbose") {
+	if md.IsDefined("global", "verbose") {
 		record("verbose")
 	}
-	if md.IsDefined("verbose_level") {
+	if md.IsDefined("global", "verbose_level") {
 		record("verbose_level")
 	}
-	if md.IsDefined("debug") {
+	if md.IsDefined("global", "debug") {
 		record("debug")
 	}
-	if md.IsDefined("trace") {
+	if md.IsDefined("global", "trace") {
 		record("trace")
 	}
-	if md.IsDefined("allow") {
+	if md.IsDefined("global", "allow") {
 		record("allow")
 	}
-	if md.IsDefined("hide_dotfiles") {
+	if md.IsDefined("global", "hide_dotfiles") {
 		record("hide_dotfiles")
 	}
-	if md.IsDefined("users") {
+	if md.IsDefined("user") {
 		record("users")
+		for _, user := range cfg.Users {
+			mask := cfg.userMask[user.Name]
+			if mask.Password {
+				record("user." + user.Name + ".password")
+			}
+			if mask.Readonly {
+				record("user." + user.Name + ".readonly")
+			}
+		}
 	}
-	if md.IsDefined("expire") {
+	if md.IsDefined("global", "expire") {
 		record("expire")
 	}
-	if md.IsDefined("pidfile") {
+	if md.IsDefined("global", "pidfile") {
 		record("pidfile")
 	}
-	if md.IsDefined("logfile") {
+	if md.IsDefined("global", "logfile") {
 		record("logfile")
 	}
-	if md.IsDefined("shares") {
+	if md.IsDefined("share") {
 		record("shares")
 		for name := range cfg.Shares {
 			mask := cfg.shareMask[name]
 			if mask.Path {
-				record("shares." + name + ".path")
+				record("share." + name + ".path")
 			}
 			if mask.AllowUsers {
-				record("shares." + name + ".allow_users")
+				record("share." + name + ".allow_users")
 			}
 			if mask.Guest {
-				record("shares." + name + ".guest")
+				record("share." + name + ".guest")
 			}
 			if mask.Readonly {
-				record("shares." + name + ".readonly")
+				record("share." + name + ".readonly")
 			}
 		}
 	}
@@ -378,8 +517,6 @@ func configValueString(cfg *Config, key string) string {
 	switch key {
 	case "listen":
 		return cfg.Listen
-	case "listen_addrs":
-		return strings.Join(cfg.ListenAddrs, ",")
 	case "advertise":
 		return strconv.FormatBool(cfg.Advertise)
 	case "readonly":
@@ -407,8 +544,8 @@ func configValueString(cfg *Config, key string) string {
 	case "shares":
 		return strconv.Itoa(len(cfg.Shares))
 	default:
-		if strings.HasPrefix(key, "shares.") {
-			rest := strings.TrimPrefix(key, "shares.")
+		if strings.HasPrefix(key, "share.") {
+			rest := strings.TrimPrefix(key, "share.")
 			name := rest
 			field := ""
 			if i := strings.Index(rest, "."); i >= 0 {
@@ -430,6 +567,27 @@ func configValueString(cfg *Config, key string) string {
 				return strings.Join(share.AllowUsers, ",")
 			}
 			return share.Path
+		}
+		if strings.HasPrefix(key, "user.") {
+			rest := strings.TrimPrefix(key, "user.")
+			name := rest
+			field := ""
+			if i := strings.Index(rest, "."); i >= 0 {
+				name = rest[:i]
+				field = rest[i+1:]
+			}
+			for _, u := range cfg.Users {
+				if u.Name != name {
+					continue
+				}
+				switch field {
+				case "password":
+					return u.Password
+				case "readonly":
+					return strconv.FormatBool(u.Readonly)
+				}
+			}
+			return ""
 		}
 	}
 	return "<unknown>"
@@ -562,7 +720,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.29"
+	version = "1.4.30"
 )
 
 func main() {
@@ -622,7 +780,7 @@ func main() {
 	// Apply config file values where CLI flags weren't explicitly set
 	if config != nil {
 		if !pflag.CommandLine.Changed("listen") {
-			if len(config.ListenAddrs) > 0 {
+			if len(config.ListenAddrs) > 1 {
 				*listenAddrs = append([]string(nil), config.ListenAddrs...)
 			} else if config.Listen != "" {
 				*listenAddrs = []string{config.Listen}
@@ -732,9 +890,6 @@ func main() {
 	markCLI := func(key string) { effectiveSrc[key] = "cli" }
 	if pflag.CommandLine.Changed("listen") {
 		markCLI("listen")
-		if len(*listenAddrs) > 1 {
-			markCLI("listen_addrs")
-		}
 	}
 	if pflag.CommandLine.Changed("readonly") {
 		markCLI("readonly")
@@ -802,23 +957,19 @@ func main() {
 		if target == "" {
 			target = ".sambamrc"
 		}
-		written, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, advertiseEnabled, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
+		_, err := writeGeneratedConfig(target, *listenAddrs, *allowAddrs, advertiseEnabled, *readOnly, *verbose, *hideDotfiles, *userSpecs, *password, *expireStr, *pidFile, *logFile, *shareSpecs, pflag.Args())
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error generating config: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("%s %s\n", Green("Generated config:"), Cyan(target))
-		if len(written) > 0 {
-			fmt.Println(Green("Set values:"))
-			for _, line := range written {
-				parts := strings.SplitN(line, "=", 2)
-				if len(parts) == 2 {
-					fmt.Printf("  %s %s %s\n", Cyan(parts[0]), Dim("="), Yellow(parts[1]))
-				} else {
-					fmt.Printf("  %s\n", line)
-				}
-			}
+		content, err := os.ReadFile(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading generated config %s: %v\n", target, err)
+			os.Exit(1)
 		}
+		fmt.Println()
+		fmt.Print(string(content))
 		os.Exit(0)
 	}
 
@@ -1658,22 +1809,34 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	written := []string{}
 	writeUserReadonly := false
 	generatedUser := ""
+	globalStarted := false
 	b.WriteString("# sambam generated configuration\n")
 	b.WriteString("# CLI flags override these settings.\n\n")
 
+	startGlobal := func() {
+		if globalStarted {
+			return
+		}
+		b.WriteString("[global]\n")
+		globalStarted = true
+	}
 	writeString := func(key, value string) {
+		startGlobal()
 		fmt.Fprintf(&b, "%s = %s\n", key, strconv.Quote(value))
 		written = append(written, fmt.Sprintf("%s=%q", key, value))
 	}
 	writeBool := func(key string, value bool) {
+		startGlobal()
 		fmt.Fprintf(&b, "%s = %t\n", key, value)
 		written = append(written, fmt.Sprintf("%s=%t", key, value))
 	}
 	writeInt := func(key string, value int) {
+		startGlobal()
 		fmt.Fprintf(&b, "%s = %d\n", key, value)
 		written = append(written, fmt.Sprintf("%s=%d", key, value))
 	}
 	writeStringArray := func(key string, values []string) {
+		startGlobal()
 		quoted := make([]string, 0, len(values))
 		for _, v := range values {
 			quoted = append(quoted, strconv.Quote(v))
@@ -1683,12 +1846,10 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	}
 
 	if pflag.CommandLine.Changed("listen") {
-		if len(listenAddrs) <= 1 {
-			if len(listenAddrs) == 1 {
-				writeString("listen", listenAddrs[0])
-			}
+		if len(listenAddrs) == 1 {
+			writeString("listen", listenAddrs[0])
 		} else {
-			writeStringArray("listen_addrs", listenAddrs)
+			writeStringArray("listen", listenAddrs)
 		}
 	}
 	if pflag.CommandLine.Changed("allow") {
@@ -1726,15 +1887,13 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 		}
 		u := users[0]
 		generatedUser = u.Name
-		b.WriteString("\n[[users]]\n")
-		fmt.Fprintf(&b, "name = %s\n", strconv.Quote(u.Name))
+		fmt.Fprintf(&b, "\n[user.%s]\n", u.Name)
 		fmt.Fprintf(&b, "password = %s\n", strconv.Quote(u.Password))
-		written = append(written, fmt.Sprintf("users[0].name=%q", u.Name))
-		written = append(written, fmt.Sprintf("users[0].password=%q", u.Password))
+		written = append(written, fmt.Sprintf("user.%s.password=%q", u.Name, u.Password))
 		if readOnly {
 			writeUserReadonly = true
 			b.WriteString("readonly = true\n")
-			written = append(written, "users[0].readonly=true")
+			written = append(written, fmt.Sprintf("user.%s.readonly=true", u.Name))
 		}
 	} else if pflag.CommandLine.Changed("password") {
 		return nil, fmt.Errorf("password requires username. Use -u/--username together with -p/--password")
@@ -1751,15 +1910,15 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			fmt.Fprintf(&b, "\n[shares.%s]\n", name)
+			fmt.Fprintf(&b, "\n[share.%s]\n", name)
 			fmt.Fprintf(&b, "path = %s\n", strconv.Quote(shares[name]))
-			written = append(written, fmt.Sprintf("shares.%s.path=%q", name, shares[name]))
+			written = append(written, fmt.Sprintf("share.%s.path=%q", name, shares[name]))
 			if generatedUser != "" {
 				fmt.Fprintf(&b, "allow_users = [%s]\n", strconv.Quote(generatedUser))
-				written = append(written, fmt.Sprintf("shares.%s.allow_users=%q", name, generatedUser))
+				written = append(written, fmt.Sprintf("share.%s.allow_users=%q", name, generatedUser))
 			} else {
 				fmt.Fprintf(&b, "guest = true\n")
-				written = append(written, fmt.Sprintf("shares.%s.guest=true", name))
+				written = append(written, fmt.Sprintf("share.%s.guest=true", name))
 			}
 		}
 	}

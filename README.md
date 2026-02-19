@@ -32,7 +32,7 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **Zero configuration** - No config files, no setup wizards, no existential dread
 - **Anonymous access** - No passwords by default (or add authentication if needed)
 - **Optional authentication** - Require username/password when you need it
-- **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[[users]]` config
+- **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[user.<name>]` config
 - **Multiple shares** - Share multiple directories with different names
 - **Per-share access control** - `allow_users` and share-level `readonly` in config
 - **Auto-expire** - Automatically stop sharing after a set time
@@ -175,23 +175,21 @@ sambam -u alice:secret1 -u bob:secret2 /data
 Tier 3 — per-share permissions (config):
 
 ```toml
-[[users]]
-name = "alice"
+[user.alice]
 password = "secret1"
 
-[[users]]
-name = "bob"
+[user.bob]
 password = "secret2"
 readonly = true
 
-[shares.media]
+[share.media]
 path = "/mnt/media"
 
-[shares.private]
+[share.private]
 path = "/home/user/private"
 allow_users = ["alice"]
 
-[shares.public]
+[share.public]
 path = "/srv/public"
 guest = true
 ```
@@ -292,8 +290,9 @@ CLI flags override all config values.
 ### Configuration Layout
 
 ```toml
+[global]
 listen = "0.0.0.0:445"
-# listen_addrs = ["@eth0:445", "10.23.22.13:445"]
+# listen = ["@eth0:445", "10.23.22.13:445"]
 
 allow = ["10.23.0.0/16"]
 advertise = true
@@ -310,34 +309,32 @@ expire = "1h"
 pidfile = "/tmp/sambam.pid"
 logfile = "/tmp/sambam.log"
 
-[[users]]
-name = "alice"
+[user.alice]
 password = "secret1"
 readonly = false
 
-[[users]]
-name = "bob"
+[user.bob]
 password = "secret2"
 readonly = true
 
-[shares.docs]
+[share.docs]
 path = "/tmp/docs"
 allow_users = ["alice", "bob"]
 readonly = false
 
-[shares.private]
+[share.private]
 path = "/tmp/private"
 allow_users = ["alice"]
 readonly = true
 
-[shares.public]
+[share.public]
 path = "/tmp/public"
 guest = true
 readonly = false
 ```
 
 Global options:
-- `listen` / `listen_addrs`
+- `listen` (string or array)
 - `allow`
 - `advertise` (default: `true`)
 - `hide_dotfiles`
@@ -347,12 +344,11 @@ Global options:
 - `logfile`
 - `verbose` / `verbose_level`
 
-Per-user options (`[[users]]`):
-- `name`
+Per-user options (`[user.<name>]`):
 - `password`
 - `readonly`
 
-Per-share options (`[shares.<name>]`):
+Per-share options (`[share.<name>]`):
 - `path`
 - `readonly`
 - `guest`
