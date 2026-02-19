@@ -46,14 +46,12 @@ type Share struct {
 type ShareConfig struct {
 	Path       string   `toml:"path"`
 	Readonly   bool     `toml:"readonly"`
-	Guest      bool     `toml:"guest"`
 	AllowUsers []string `toml:"allow_users"`
 }
 
 type shareFieldMask struct {
 	Path       bool
 	Readonly   bool
-	Guest      bool
 	AllowUsers bool
 }
 
@@ -284,11 +282,11 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		if _, ok := rawShare["readonly"]; ok {
 			mask.Readonly = true
 		}
-		if _, ok := rawShare["guest"]; ok {
-			mask.Guest = true
-		}
 		if _, ok := rawShare["allow_users"]; ok {
 			mask.AllowUsers = true
+		}
+		if _, ok := rawShare["guest"]; ok {
+			return nil, md, fmt.Errorf("share.%s.guest is no longer supported; use allow_users = [\"guest\"]", name)
 		}
 		cfg.shareMask[name] = mask
 	}
@@ -422,16 +420,12 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 			if mask.Readonly {
 				cur.Readonly = share.Readonly
 			}
-			if mask.Guest {
-				cur.Guest = share.Guest
-			}
 			if mask.AllowUsers {
 				cur.AllowUsers = append([]string(nil), share.AllowUsers...)
 			}
 			dst.Shares[name] = cur
 			dstMask.Path = dstMask.Path || mask.Path
 			dstMask.Readonly = dstMask.Readonly || mask.Readonly
-			dstMask.Guest = dstMask.Guest || mask.Guest
 			dstMask.AllowUsers = dstMask.AllowUsers || mask.AllowUsers
 			dst.shareMask[name] = dstMask
 		}
@@ -500,9 +494,6 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 			if mask.AllowUsers {
 				record("share." + name + ".allow_users")
 			}
-			if mask.Guest {
-				record("share." + name + ".guest")
-			}
 			if mask.Readonly {
 				record("share." + name + ".readonly")
 			}
@@ -561,8 +552,6 @@ func configValueString(cfg *Config, key string) string {
 				return share.Path
 			case "readonly":
 				return strconv.FormatBool(share.Readonly)
-			case "guest":
-				return strconv.FormatBool(share.Guest)
 			case "allow_users":
 				return strings.Join(share.AllowUsers, ",")
 			}
@@ -720,7 +709,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.31"
+	version = "1.4.32"
 )
 
 func main() {
@@ -1069,7 +1058,12 @@ func main() {
 	if config != nil && len(config.Shares) > 0 {
 		for name, sc := range config.Shares {
 			if strings.TrimSpace(sc.Path) == "" {
-				fmt.Fprintf(os.Stderr, "Error: shares.%s.path is required (set in one of the loaded config files)\n", name)
+				fmt.Fprintf(os.Stderr, "Error: share.%s.path is required (set in one of the loaded config files)\n", name)
+				os.Exit(1)
+			}
+			mask := config.shareMask[name]
+			if !mask.AllowUsers {
+				fmt.Fprintf(os.Stderr, "Error: share.%s.allow_users is required (set in one of the loaded config files)\n", name)
 				os.Exit(1)
 			}
 			absPath, err := filepath.Abs(sc.Path)
@@ -1081,7 +1075,6 @@ func main() {
 				Name:       name,
 				Path:       absPath,
 				ReadOnly:   sc.Readonly || *readOnly,
-				Guest:      sc.Guest,
 				AllowUsers: append([]string(nil), sc.AllowUsers...),
 			}
 		}
@@ -1153,12 +1146,41 @@ func main() {
 		shares = append(shares, shareMap[name])
 	}
 
-	// Validate per-share access policy: guest and allow_users are mutually exclusive.
+	// Validate and normalize per-share access policy.
 	for _, share := range shares {
-		if share.Guest && len(share.AllowUsers) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: shares.%s has conflicting access settings: guest=true cannot be combined with allow_users\n", share.Name)
+		guestEntries := 0
+		for _, u := range share.AllowUsers {
+			if strings.EqualFold(strings.TrimSpace(u), "guest") {
+				guestEntries++
+			}
+		}
+		if guestEntries > 1 {
+			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users cannot contain duplicate guest entries\n", share.Name)
 			os.Exit(1)
 		}
+		if guestEntries == 1 && len(share.AllowUsers) != 1 {
+			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users cannot combine guest with named users\n", share.Name)
+			os.Exit(1)
+		}
+		if guestEntries == 1 {
+			shareMap[share.Name] = Share{
+				Name:       share.Name,
+				Path:       share.Path,
+				ReadOnly:   share.ReadOnly,
+				Guest:      true,
+				AllowUsers: []string{"guest"},
+			}
+		}
+		if len(authUsers) == 0 && len(share.AllowUsers) > 0 && guestEntries == 0 {
+			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users references named users but no [user.<name>] entries are configured\n", share.Name)
+			os.Exit(1)
+		}
+	}
+
+	// Rebuild sorted share list after normalization.
+	shares = shares[:0]
+	for _, name := range shareNames {
+		shares = append(shares, shareMap[name])
 	}
 
 	// Verify all share directories exist
@@ -1657,9 +1679,14 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 	firstIP := displayIPs[0]
 	firstShare := shares[0].Name
 	comboCount := len(displayIPs) * len(shares)
+	mountOptForShare := func(share Share) string {
+		if share.Guest {
+			return "guest"
+		}
+		return authMount
+	}
 
 	fmt.Println()
-	authOpt := authMount
 	portOpt := ""
 	if nonStdPort {
 		portOpt = ",port=" + portNum
@@ -1669,7 +1696,7 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 		fmt.Println("  Connect:")
 		fmt.Printf("  %-12s %s\n", "Windows", Cyan(fmt.Sprintf("\\\\%s\\%s", firstIP, firstShare)))
 		fmt.Printf("  %-12s %s\n", "macOS", Cyan(fmt.Sprintf("smb://%s/%s", firstIP, firstShare)))
-		fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, authOpt, portOpt)))
+		fmt.Printf("  %-12s %s\n", "Linux", Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", firstIP, firstShare, mountOptForShare(shares[0]), portOpt)))
 		if comboCount > 1 {
 			fmt.Printf("  %-12s %s\n", "", Dim(fmt.Sprintf("(%d additional share/ip combinations; use -vv to show all)", comboCount-1)))
 		}
@@ -1716,6 +1743,7 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 					prefix = ""
 					first = false
 				}
+				authOpt := mountOptForShare(share)
 				fmt.Printf("%s%s\n", prefix, Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s", ip, share.Name, authOpt, portOpt)))
 				fmt.Printf("%s%s %s\n", contPrefix, Cyan(fmt.Sprintf("sudo mount -t cifs //%s/%s /mnt -o %s%s,vers=3.1.1,posix,cifsacl", ip, share.Name, authOpt, portOpt)), Dim("# POSIX"))
 			}
@@ -1931,8 +1959,8 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 				fmt.Fprintf(&b, "allow_users = [%s]\n", strconv.Quote(generatedUser))
 				written = append(written, fmt.Sprintf("share.%s.allow_users=%q", name, generatedUser))
 			} else {
-				fmt.Fprintf(&b, "guest = true\n")
-				written = append(written, fmt.Sprintf("share.%s.guest=true", name))
+				fmt.Fprintf(&b, "allow_users = [\"guest\"]\n")
+				written = append(written, fmt.Sprintf("share.%s.allow_users=%q", name, "guest"))
 			}
 		}
 	}

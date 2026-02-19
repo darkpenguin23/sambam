@@ -105,11 +105,17 @@ password = "secret"
 
 [share.docs]
 path = "/tmp"
-guest = true
-allow_users = ["test"]
+allow_users = ["guest", "test"]
 EOF
-run_expect_fail_contains "reject guest + allow_users conflict" "guest=true cannot be combined with allow_users" \
+run_expect_fail_contains "reject guest + allow_users conflict" "allow_users cannot combine guest with named users" \
   "${BIN}" -c "${TMP_BASE}/policy-conflict.toml"
+
+cat >"${TMP_BASE}/missing-allow-users.toml" <<'EOF'
+[share.docs]
+path = "/tmp"
+EOF
+run_expect_fail_contains "require per-share allow_users" "share.docs.allow_users is required" \
+  "${BIN}" -c "${TMP_BASE}/missing-allow-users.toml"
 
 run_expect_ok "gen-config single user writes allow_users" \
   "${BIN}" -u test -p secret -n docs:/tmp -G "${TMP_BASE}/gen-user.toml"
@@ -120,12 +126,12 @@ else
   sed -n '1,120p' "${TMP_BASE}/gen-user.toml"
 fi
 
-run_expect_ok "gen-config anonymous writes guest=true" \
+run_expect_ok "gen-config anonymous writes allow_users=[guest]" \
   "${BIN}" -n docs:/tmp -G "${TMP_BASE}/gen-guest.toml"
-if grep -Fq 'guest = true' "${TMP_BASE}/gen-guest.toml"; then
-  ok "generated guest=true present"
+if grep -Fq 'allow_users = ["guest"]' "${TMP_BASE}/gen-guest.toml"; then
+  ok "generated allow_users=[guest] present"
 else
-  bad "generated guest=true present"
+  bad "generated allow_users=[guest] present"
   sed -n '1,120p' "${TMP_BASE}/gen-guest.toml"
 fi
 
@@ -134,7 +140,7 @@ cat >"${TMP_BASE}/explicit-only.toml" <<'EOF'
 listen = "127.0.0.1:14445"
 [share.docs]
 path = "/tmp"
-guest = true
+allow_users = ["guest"]
 EOF
 mkdir -p "${TMP_BASE}/work"
 cat >"${TMP_BASE}/work/.sambamrc" <<'EOF'
@@ -142,7 +148,7 @@ cat >"${TMP_BASE}/work/.sambamrc" <<'EOF'
 listen = "127.0.0.1:15555"
 [share.bad]
 path = "/var"
-guest = true
+allow_users = ["guest"]
 EOF
 run_expect_ok "explicit -c ignores local .sambamrc" \
   bash -lc "cd '${TMP_BASE}/work' && timeout 2s '${BIN}' -c '${TMP_BASE}/explicit-only.toml' -v >/tmp/sambam-smoke-banner.log 2>/dev/null || true"
@@ -201,7 +207,7 @@ else
 listen = "127.0.0.1:14446"
 [share.smoke]
 path = "${SRC_DIR}"
-guest = true
+allow_users = ["guest"]
 EOF
 
   "${BIN}" -c "${CFG_FILE}" -L "${LOG_FILE}" >/dev/null 2>&1 &
@@ -293,7 +299,7 @@ listen = "127.0.0.1:14447"
 readonly = true
 [share.smoke]
 path = "${SRC_DIR}"
-guest = true
+allow_users = ["guest"]
 EOF
 
   "${BIN}" -c "${RO_CFG_FILE}" -L "${RO_LOG_FILE}" >/dev/null 2>&1 &

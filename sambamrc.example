@@ -53,5 +53,5 @@ readonly = true
 
 [share.public]
 path = "/tmp/public"
-guest = true
+allow_users = ["guest"]
 readonly = false

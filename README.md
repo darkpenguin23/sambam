@@ -191,7 +191,7 @@ allow_users = ["alice"]
 
 [share.public]
 path = "/srv/public"
-guest = true
+allow_users = ["guest"]
 ```
 
 ### `-e, --expire <duration>`
@@ -329,7 +329,7 @@ readonly = true
 
 [share.public]
 path = "/tmp/public"
-guest = true
+allow_users = ["guest"]
 readonly = false
 ```
 
@@ -351,11 +351,10 @@ Per-user options (`[user.<name>]`):
 Per-share options (`[share.<name>]`):
 - `path`
 - `readonly`
-- `guest`
 - `allow_users`
 
 Notes:
-- `guest = true` allows anonymous access for that share.
+- `allow_users = ["guest"]` creates a guest-only (anonymous) share.
 - `allow_users` restricts a share to specific authenticated users.
 
 See `sambamrc.example` for a full example.
