@@ -116,7 +116,7 @@ If one or more `--allow` rules are set, only matching clients can connect.
 sambam -a 192.168.1.10 -a 192.168.2.0/24 /data
 ```
 
-### `--no-advertise`
+### `-x, --no-advertise`
 
 By default, sambam advertises the SMB service for LAN discovery using:
 - Bonjour/mDNS (`_smb._tcp`)
@@ -127,10 +127,11 @@ Ports used by sambam:
 - `UDP 3702` (WS-Discovery probe/resolve)
 - `TCP 5357` (WS-Discovery metadata HTTP)
 
-Use `--no-advertise` to disable discovery announcements.
+Use `-x` / `--no-advertise` to disable discovery announcements.
 
 ```bash
 sambam /data
+sambam -x /data
 sambam --no-advertise /data
 ```
 

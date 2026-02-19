@@ -582,7 +582,7 @@ func main() {
 	shareSpecs := pflag.StringArrayP("name", "n", []string{}, "Share specification (name:path or just name)")
 	listenAddrs := pflag.StringArrayP("listen", "l", []string{}, "Address or @interface to listen on (repeatable)")
 	allowAddrs := pflag.StringArrayP("allow", "a", []string{}, "Allow client IP/CIDR (repeatable)")
-	noAdvertise := pflag.Bool("no-advertise", false, "Disable share advertisement")
+	noAdvertise := pflag.BoolP("no-advertise", "x", false, "Disable share advertisement")
 	readOnly := pflag.BoolP("readonly", "r", false, "Make share read-only")
 	showVersion := pflag.BoolP("version", "V", false, "Show version")
 	showHelp := pflag.BoolP("help", "h", false, "Show help")
@@ -606,7 +606,7 @@ func main() {
 
 	// Auto-expire flag
 	expireStr := pflag.StringP("expire", "e", "", "Auto-shutdown after duration (e.g., 30m, 1h, 2h30m)")
-	generateConfigPath := pflag.StringP("gen-config", "G", "", "Generate new-style config TOML and exit (optional path)")
+	generateConfigPath := pflag.StringP("gen-config", "G", "", "Generate config TOML and exit (optional path)")
 	pflag.Lookup("gen-config").NoOptDefVal = ".sambamrc"
 
 	os.Args = normalizeCLIArgs(os.Args)
@@ -1125,7 +1125,9 @@ func main() {
 			fmt.Printf("  %-12s %d\n", "PID", child.Pid)
 			fmt.Printf("  %-12s %s\n", "PID file", *pidFile)
 			fmt.Printf("  %-12s %s\n", "Log file", formatLogFileDisplay(logFileName))
-			fmt.Printf("  %-12s %s\n", "Control", Cyan("sambam stop"))
+			fmt.Printf("  %-12s %s%s%s\n", "Control", Cyan("sambam stop"), Dim(" | "), Cyan("sambam status"))
+			fmt.Println()
+			fmt.Printf("  %s\n", Red("Daemon mode: running in background"))
 			os.Exit(0)
 		}
 
@@ -1563,11 +1565,9 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 		}
 	}
 	fmt.Println()
-	if daemonMode {
-		fmt.Printf("  %s\n", Red("Daemon mode: running in background"))
-	} else if expireStr != "" {
+	if !daemonMode && expireStr != "" {
 		fmt.Printf("  %s\n", Dim("Press Ctrl+C to stop, or wait for expiry"))
-	} else {
+	} else if !daemonMode {
 		fmt.Printf("  %s\n", Dim("Press Ctrl+C to stop"))
 	}
 }
@@ -1595,19 +1595,19 @@ func printUsage() {
 
 	printOpt("-n, --name", "Share name or name:path "+Dim("(repeatable)"))
 	printOpt("-l, --listen", "Address or @interface to listen on "+Dim("(repeatable, default: 0.0.0.0:445)"))
-	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
-	printOpt("    --no-advertise", "Disable share advertisement")
-	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-u, --username", "Require authentication "+Dim("(user or user:password, repeatable)"))
 	printOpt("-p, --password", "Password "+Dim("(random if not set)"))
+	printOpt("-r, --readonly", "Make share read-only")
 	printOpt("-e, --expire", "Auto-shutdown after duration "+Dim("(e.g., 30m, 1h)"))
+	printOpt("-d, --daemon", "Run as background daemon")
 	printOpt("-v, --verbose", "Show connections and file activity "+Dim("(-vv extended, -vvv full trace)"))
 	printOpt("-H, --hide-dotfiles", "Hide files starting with '.'")
-	printOpt("-d, --daemon", "Run as background daemon")
+	printOpt("-a, --allow", "Allow client IP/CIDR "+Dim("(repeatable, default: allow all)"))
+	printOpt("-x, --no-advertise", "Disable share advertisement")
+	printOpt("-c, --config", "Config file "+Dim("(repeatable, disables default config discovery)"))
+	printOpt("-G, --gen-config", "Generate config TOML and exit "+Dim("(default: ./.sambamrc)"))
 	printOpt("-P, --pidfile", "PID file location "+Dim("(default: /tmp/sambam.pid)"))
 	printOpt("-L, --logfile", "Log file path "+Dim("(default /tmp/sambam.log when omitted)"))
-	printOpt("-c, --config", "Config file "+Dim("(repeatable, disables default config discovery)"))
-	printOpt("-G, --gen-config", "Generate new-style config TOML and exit "+Dim("(default: ./.sambamrc)"))
 	printOpt("-V, --version", "Show version")
 	printOpt("-h, --help", "Show help")
 	fmt.Println()
