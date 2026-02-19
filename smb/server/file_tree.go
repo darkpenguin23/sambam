@@ -963,7 +963,7 @@ func (t *fileTree) writeImpl(ctx *compoundContext, pkt []byte, fileId *FileId, o
 		open.ioMu.Unlock()
 	}
 
-	if err != nil || n == 0 {
+	if err != nil {
 		log.Errorf("Write failed: %v", err)
 		status := STATUS_IO_DEVICE_ERROR
 		rsp := new(ErrorResponse)
@@ -2304,7 +2304,7 @@ func (t *fileTree) setDispositionInfo(ctx *compoundContext, fileId *FileId, open
 func (t *fileTree) setDispositionInfoEa(ctx *compoundContext, fileId *FileId, eaKey string, pkt []byte) error {
 	c := t.session.conn
 
-	if err := t.fs.Removexattr(vfs.VfsHandle(fileId.HandleId()), eaKey); err != nil {
+	if err := t.fs.Removexattr(vfs.VfsHandle(fileId.HandleId()), eaKey); err != nil && err != syscall.ENODATA {
 		log.Errorf("removexattr failed: %v", err)
 		rsp := new(ErrorResponse)
 		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_NOT_FOUND))

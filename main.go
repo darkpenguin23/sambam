@@ -720,7 +720,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.30"
+	version = "1.4.31"
 )
 
 func main() {
@@ -1347,7 +1347,21 @@ func main() {
 		onConnect = func(remoteAddr string) {
 			logrus.Infof("connect: %s", remoteAddr)
 		}
+		var modLogMu sync.Mutex
+		modLogLast := map[string]time.Time{}
 		onDetect = func(action, path string) {
+			if action == "modified" {
+				modLogMu.Lock()
+				now := time.Now()
+				skip := now.Sub(modLogLast[path]) < 2*time.Second
+				if !skip {
+					modLogLast[path] = now
+				}
+				modLogMu.Unlock()
+				if skip {
+					return
+				}
+			}
 			logrus.Infof("detected: %s %s", action, path)
 		}
 	}

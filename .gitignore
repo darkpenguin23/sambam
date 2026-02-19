@@ -17,9 +17,8 @@ dist/
 Thumbs.db
 *.zip
 
-# Release config and script (contains tokens)
+# Release config (contains tokens - never commit)
 .release-config
-release.sh
 
 # Local generated config (for testing -G flag)
 .sambamrc
