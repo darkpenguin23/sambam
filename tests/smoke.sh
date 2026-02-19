@@ -107,8 +107,16 @@ password = "secret"
 path = "/tmp"
 allow_users = ["guest", "test"]
 EOF
-run_expect_fail_contains "reject guest + allow_users conflict" "allow_users cannot combine guest with named users" \
-  "${BIN}" -c "${TMP_BASE}/policy-conflict.toml"
+run_expect_ok "allow guest + named users on one share" \
+  bash -lc "timeout 2s '${BIN}' -c '${TMP_BASE}/policy-conflict.toml' -v >/tmp/sambam-smoke-policy.log 2>/dev/null || true"
+
+cat >"${TMP_BASE}/policy-duplicate-guest.toml" <<'EOF'
+[share.docs]
+path = "/tmp"
+allow_users = ["guest", "guest"]
+EOF
+run_expect_fail_contains "reject duplicate guest entries" "allow_users cannot contain duplicate guest entries" \
+  "${BIN}" -c "${TMP_BASE}/policy-duplicate-guest.toml"
 
 cat >"${TMP_BASE}/missing-allow-users.toml" <<'EOF'
 [share.docs]

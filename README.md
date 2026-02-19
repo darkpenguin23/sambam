@@ -128,6 +128,7 @@ Ports used by sambam:
 - `TCP 5357` (WS-Discovery metadata HTTP)
 
 Use `-x` / `--no-advertise` to disable discovery announcements.
+Set `[global].discovery_name_mdns` and `[global].discovery_name_wsd` in config to control discovery names for macOS (mDNS) and Windows (WSD).
 
 ```bash
 sambam /data
@@ -296,6 +297,8 @@ listen = "0.0.0.0:445"
 
 allow = ["10.23.0.0/16"]
 advertise = true
+discovery_name_mdns = "sambam-dev-sambam"
+discovery_name_wsd = "sambam-dev"
 readonly = false
 hide_dotfiles = false
 
@@ -337,6 +340,8 @@ Global options:
 - `listen` (string or array)
 - `allow`
 - `advertise` (default: `true`)
+- `discovery_name_mdns` (default: `<hostname>-sambam`)
+- `discovery_name_wsd` (default: `<hostname>`)
 - `hide_dotfiles`
 - `readonly`
 - `expire`
@@ -355,7 +360,8 @@ Per-share options (`[share.<name>]`):
 
 Notes:
 - `allow_users = ["guest"]` creates a guest-only (anonymous) share.
-- `allow_users` restricts a share to specific authenticated users.
+- `allow_users = ["alice", "bob"]` restricts a share to specific authenticated users.
+- `allow_users = ["guest", "alice"]` allows both guest and selected users.
 
 See `sambamrc.example` for a full example.
 

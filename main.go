@@ -68,23 +68,25 @@ type userFieldMask struct {
 
 // Config represents sambam configuration values loaded from rc files.
 type Config struct {
-	Listen       string
-	ListenAddrs  []string
-	Advertise    bool
-	Readonly     bool
-	Verbose      bool
-	VerboseLevel int
-	Debug        bool // backward compatibility: maps to verbose_level=3
-	Trace        bool
-	Allow        []string
-	HideDotfiles bool
-	Users        []UserConfig
-	Expire       string
-	PidFile      string
-	LogFile      string
-	Shares       map[string]ShareConfig
-	userMask     map[string]userFieldMask
-	shareMask    map[string]shareFieldMask
+	Listen            string
+	ListenAddrs       []string
+	Advertise         bool
+	DiscoveryNameMDNS string
+	DiscoveryNameWSD  string
+	Readonly          bool
+	Verbose           bool
+	VerboseLevel      int
+	Debug             bool // backward compatibility: maps to verbose_level=3
+	Trace             bool
+	Allow             []string
+	HideDotfiles      bool
+	Users             []UserConfig
+	Expire            string
+	PidFile           string
+	LogFile           string
+	Shares            map[string]ShareConfig
+	userMask          map[string]userFieldMask
+	shareMask         map[string]shareFieldMask
 }
 
 type ConfigLoadInfo struct {
@@ -161,7 +163,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	}
 
 	legacyRoots := []string{
-		"listen", "listen_addrs", "allow", "advertise", "readonly",
+		"listen", "listen_addrs", "allow", "advertise", "discovery_name_mdns", "discovery_name_wsd", "readonly",
 		"verbose", "verbose_level", "debug", "trace", "hide_dotfiles",
 		"expire", "pidfile", "logfile", "users", "shares", "username", "password",
 	}
@@ -218,22 +220,26 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 			return nil, md, fmt.Errorf("invalid [global] section")
 		}
 		type globalConfig struct {
-			Advertise    bool   `toml:"advertise"`
-			Readonly     bool   `toml:"readonly"`
-			Verbose      bool   `toml:"verbose"`
-			VerboseLevel int    `toml:"verbose_level"`
-			Debug        bool   `toml:"debug"`
-			Trace        bool   `toml:"trace"`
-			HideDotfiles bool   `toml:"hide_dotfiles"`
-			Expire       string `toml:"expire"`
-			PidFile      string `toml:"pidfile"`
-			LogFile      string `toml:"logfile"`
+			Advertise         bool   `toml:"advertise"`
+			DiscoveryNameMDNS string `toml:"discovery_name_mdns"`
+			DiscoveryNameWSD  string `toml:"discovery_name_wsd"`
+			Readonly          bool   `toml:"readonly"`
+			Verbose           bool   `toml:"verbose"`
+			VerboseLevel      int    `toml:"verbose_level"`
+			Debug             bool   `toml:"debug"`
+			Trace             bool   `toml:"trace"`
+			HideDotfiles      bool   `toml:"hide_dotfiles"`
+			Expire            string `toml:"expire"`
+			PidFile           string `toml:"pidfile"`
+			LogFile           string `toml:"logfile"`
 		}
 		var gcfg globalConfig
 		if err := md.PrimitiveDecode(raw.Global, &gcfg); err != nil {
 			return nil, md, fmt.Errorf("invalid [global] section")
 		}
 		cfg.Advertise = gcfg.Advertise
+		cfg.DiscoveryNameMDNS = gcfg.DiscoveryNameMDNS
+		cfg.DiscoveryNameWSD = gcfg.DiscoveryNameWSD
 		cfg.Readonly = gcfg.Readonly
 		cfg.Verbose = gcfg.Verbose
 		cfg.VerboseLevel = gcfg.VerboseLevel
@@ -262,6 +268,9 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 				return nil, md, err
 			}
 			cfg.Allow = append([]string(nil), allowVals...)
+		}
+		if _, ok := gmap["discovery_name"]; ok {
+			return nil, md, fmt.Errorf("global.discovery_name is no longer supported; use global.discovery_name_mdns and/or global.discovery_name_wsd")
 		}
 	}
 
@@ -336,6 +345,12 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	}
 	if md.IsDefined("global", "advertise") {
 		dst.Advertise = src.Advertise
+	}
+	if md.IsDefined("global", "discovery_name_mdns") {
+		dst.DiscoveryNameMDNS = src.DiscoveryNameMDNS
+	}
+	if md.IsDefined("global", "discovery_name_wsd") {
+		dst.DiscoveryNameWSD = src.DiscoveryNameWSD
 	}
 	if md.IsDefined("global", "readonly") {
 		dst.Readonly = src.Readonly
@@ -442,6 +457,12 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("global", "advertise") {
 		record("advertise")
 	}
+	if md.IsDefined("global", "discovery_name_mdns") {
+		record("discovery_name_mdns")
+	}
+	if md.IsDefined("global", "discovery_name_wsd") {
+		record("discovery_name_wsd")
+	}
 	if md.IsDefined("global", "readonly") {
 		record("readonly")
 	}
@@ -510,6 +531,10 @@ func configValueString(cfg *Config, key string) string {
 		return cfg.Listen
 	case "advertise":
 		return strconv.FormatBool(cfg.Advertise)
+	case "discovery_name_mdns":
+		return cfg.DiscoveryNameMDNS
+	case "discovery_name_wsd":
+		return cfg.DiscoveryNameWSD
 	case "readonly":
 		return strconv.FormatBool(cfg.Readonly)
 	case "verbose":
@@ -709,7 +734,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.32"
+	version = "1.4.33"
 )
 
 func main() {
@@ -1149,31 +1174,29 @@ func main() {
 	// Validate and normalize per-share access policy.
 	for _, share := range shares {
 		guestEntries := 0
+		normalizedUsers := make([]string, 0, len(share.AllowUsers))
 		for _, u := range share.AllowUsers {
-			if strings.EqualFold(strings.TrimSpace(u), "guest") {
+			trimmedUser := strings.TrimSpace(u)
+			if strings.EqualFold(trimmedUser, "guest") {
 				guestEntries++
+				continue
 			}
+			normalizedUsers = append(normalizedUsers, trimmedUser)
 		}
 		if guestEntries > 1 {
 			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users cannot contain duplicate guest entries\n", share.Name)
 			os.Exit(1)
 		}
-		if guestEntries == 1 && len(share.AllowUsers) != 1 {
-			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users cannot combine guest with named users\n", share.Name)
-			os.Exit(1)
-		}
-		if guestEntries == 1 {
-			shareMap[share.Name] = Share{
-				Name:       share.Name,
-				Path:       share.Path,
-				ReadOnly:   share.ReadOnly,
-				Guest:      true,
-				AllowUsers: []string{"guest"},
-			}
-		}
-		if len(authUsers) == 0 && len(share.AllowUsers) > 0 && guestEntries == 0 {
+		if len(authUsers) == 0 && len(normalizedUsers) > 0 {
 			fmt.Fprintf(os.Stderr, "Error: share.%s allow_users references named users but no [user.<name>] entries are configured\n", share.Name)
 			os.Exit(1)
+		}
+		shareMap[share.Name] = Share{
+			Name:       share.Name,
+			Path:       share.Path,
+			ReadOnly:   share.ReadOnly,
+			Guest:      guestEntries == 1,
+			AllowUsers: normalizedUsers,
 		}
 	}
 
@@ -1466,7 +1489,7 @@ func main() {
 	var discovery *discoveryAdvertiser
 	advertiseStarted := false
 	if advertiseEnabled {
-		discovery, err = startSMBAdvertiser(shares, listenEndpoints, listenPort, authUsers, *allowAddrs)
+		discovery, err = startSMBAdvertiser(shares, listenEndpoints, listenPort, authUsers, *allowAddrs, effectiveConfig.DiscoveryNameMDNS, effectiveConfig.DiscoveryNameWSD)
 		if err != nil {
 			logrus.Warnf("advertise disabled: %v", err)
 		} else {
@@ -2113,7 +2136,23 @@ func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
 	return endpoints, commonPort, nil
 }
 
-func startSMBAdvertiser(shares []Share, endpoints []listenEndpoint, listenPort string, users []authUser, allowAddrs []string) (*discoveryAdvertiser, error) {
+func defaultWSDDiscoveryName(hostname string) string {
+	name := strings.TrimSpace(hostname)
+	if name == "" {
+		name = "sambam"
+	}
+	return name
+}
+
+func defaultMDNSDiscoveryName(hostname string) string {
+	name := strings.TrimSpace(hostname)
+	if name == "" {
+		name = "sambam"
+	}
+	return name + "-sambam"
+}
+
+func startSMBAdvertiser(shares []Share, endpoints []listenEndpoint, listenPort string, users []authUser, allowAddrs []string, mdnsName string, wsdName string) (*discoveryAdvertiser, error) {
 	if len(shares) == 0 {
 		return nil, fmt.Errorf("no shares to advertise")
 	}
@@ -2128,9 +2167,10 @@ func startSMBAdvertiser(shares []Share, endpoints []listenEndpoint, listenPort s
 	}
 	sort.Strings(shareNames)
 
-	instance := "sambam-" + shareNames[0]
-	if len(shareNames) > 1 {
-		instance = fmt.Sprintf("sambam-%d-shares", len(shareNames))
+	hostname, _ := os.Hostname()
+	instance := strings.TrimSpace(mdnsName)
+	if instance == "" {
+		instance = defaultMDNSDiscoveryName(hostname)
 	}
 	if len(instance) > 63 {
 		instance = instance[:63]
@@ -2161,7 +2201,7 @@ func startSMBAdvertiser(shares []Share, endpoints []listenEndpoint, listenPort s
 		adv.mdns = s
 	}
 
-	wsd, err := startWSDiscovery(shares, endpoints)
+	wsd, err := startWSDiscovery(shares, endpoints, wsdName)
 	if err != nil {
 		errs = append(errs, "WSD: "+err.Error())
 	} else {
@@ -2254,7 +2294,7 @@ func xmlFieldValue(xml, local string) string {
 	return ""
 }
 
-func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryService, error) {
+func startWSDiscovery(shares []Share, endpoints []listenEndpoint, wsdName string) (*wsDiscoveryService, error) {
 	ips := advertiseIPsFromEndpoints(endpoints)
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no usable IP addresses for WSD")
@@ -2262,6 +2302,10 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryS
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "sambam"
+	}
+	friendlyName := strings.TrimSpace(wsdName)
+	if friendlyName == "" {
+		friendlyName = defaultWSDDiscoveryName(hostname)
 	}
 	workgroup := strings.TrimSpace(os.Getenv("SAMBA_WORKGROUP"))
 	if workgroup == "" {
@@ -2275,7 +2319,7 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryS
 		shareNames = append(shareNames, s.Name)
 	}
 	sort.Strings(shareNames)
-	seed := hostname + "|" + strings.Join(shareNames, ",")
+	seed := hostname + "|" + strings.Join(shareNames, ",") + "|" + friendlyName
 	uuid := stableUUIDFromSeed(seed)
 
 	mcast := &net.UDPAddr{IP: net.ParseIP("239.255.255.250"), Port: 3702}
@@ -2292,7 +2336,7 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryS
 		endpointUUID:    uuid,
 		xaddr:           fmt.Sprintf("http://%s:5357/sambam/wsd", ips[0]),
 		xaddrs:          make([]string, 0, len(ips)),
-		friendlyName:    hostname,
+		friendlyName:    friendlyName,
 		manufacturer:    "sambam",
 		workgroup:       workgroup,
 		scopes:          "smb://" + ips[0] + "/",
