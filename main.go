@@ -103,6 +103,7 @@ type daemonStatus struct {
 	Listen     string   `json:"listen"`
 	Auth       string   `json:"auth"`
 	AllowAddrs []string `json:"allow_addrs"`
+	ExpiresAt  string   `json:"expires_at,omitempty"`
 	UpdatedAt  string   `json:"updated_at"`
 }
 
@@ -1110,6 +1111,11 @@ func main() {
 				AllowAddrs: append([]string(nil), *allowAddrs...),
 				UpdatedAt:  time.Now().UTC().Format(time.RFC3339),
 			}
+			if *expireStr != "" {
+				if d, err := time.ParseDuration(*expireStr); err == nil {
+					status.ExpiresAt = time.Now().Add(d).UTC().Format(time.RFC3339)
+				}
+			}
 			if err := writeDaemonStatus(statusPath, status); err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: failed to write status file %s: %v\n", statusPath, err)
 			}
@@ -1118,7 +1124,7 @@ func main() {
 			fmt.Printf("  %-12s %s\n", "Status", Green("daemon started"))
 			fmt.Printf("  %-12s %d\n", "PID", child.Pid)
 			fmt.Printf("  %-12s %s\n", "PID file", *pidFile)
-			fmt.Printf("  %-12s %s\n", "Log file", logFileName)
+			fmt.Printf("  %-12s %s\n", "Log file", formatLogFileDisplay(logFileName))
 			fmt.Printf("  %-12s %s\n", "Control", Cyan("sambam stop"))
 			os.Exit(0)
 		}
@@ -1261,6 +1267,12 @@ func main() {
 		vfsShares,
 	)
 
+	// Print banner in foreground mode.
+	if !*daemonMode {
+		printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, false, extraVerbose)
+		printConfigLogs()
+	}
+
 	// Optional Bonjour/mDNS + WS-Discovery advertisement for discovery.
 	var discovery *discoveryAdvertiser
 	advertiseStarted := false
@@ -1270,19 +1282,10 @@ func main() {
 			logrus.Warnf("advertise disabled: %v", err)
 		} else {
 			advertiseStarted = true
-			if *daemonMode {
-				logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
-			}
 		}
 	}
-
-	// Print banner in foreground mode.
-	if !*daemonMode {
-		printBanner(shares, listenDisplay, displayIPs, portSuffix, *allowAddrs, authDisplay(authUsers), mountAuthOpt(authUsers), *expireStr, false, extraVerbose)
-		printConfigLogs()
-		if advertiseStarted {
-			logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
-		}
+	if advertiseStarted {
+		logrus.Infof("advertising via mDNS + WSD on SMB port %s", listenPort)
 	}
 
 	// Start server in goroutine
@@ -1308,34 +1311,42 @@ func main() {
 
 	// Setup expiry timer if specified
 	var expireTimer *time.Timer
-	var expireTime time.Time
+	var expireCountdownStop chan struct{}
 	if *expireStr != "" {
 		duration, err := time.ParseDuration(*expireStr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Invalid expire duration: %v\n", err)
 			os.Exit(1)
 		}
-		expireTime = time.Now().Add(duration)
+		expireAt := time.Now().Add(duration)
 		expireTimer = time.NewTimer(duration)
 
-		// Start countdown display goroutine (only in foreground mode)
+		// In foreground mode, print periodic remaining-time updates as normal lines.
+		// This avoids carriage-return redraw collisions with incoming logs.
 		if !*daemonMode {
-			go func() {
+			expireCountdownStop = make(chan struct{})
+			logrus.Infof("expires in %s", formatDuration(duration))
+			go func(until time.Time) {
 				ticker := time.NewTicker(1 * time.Second)
 				defer ticker.Stop()
+				lastShown := -1
 				for {
 					select {
 					case <-ticker.C:
-						remaining := time.Until(expireTime)
-						if remaining > 0 {
-							// Move cursor up and clear line, then print countdown
-							fmt.Printf("\r  %s %s   ", Dim("Expires in"), Yellow(formatDuration(remaining)))
+						remaining := int(time.Until(until).Round(time.Second) / time.Second)
+						if remaining <= 0 {
+							return
 						}
-					case <-sigChan:
+						show := remaining <= 10 || remaining%10 == 0
+						if show && remaining != lastShown {
+							logrus.Infof("expires in %s", formatDuration(time.Duration(remaining)*time.Second))
+							lastShown = remaining
+						}
+					case <-expireCountdownStop:
 						return
 					}
 				}
-			}()
+			}(expireAt)
 		}
 	}
 
@@ -1358,6 +1369,9 @@ func main() {
 		log.Println("Shutting down...")
 	} else if !*daemonMode {
 		fmt.Println("\nShutting down...")
+	}
+	if expireCountdownStop != nil {
+		close(expireCountdownStop)
 	}
 	if discovery != nil {
 		discovery.Shutdown()
@@ -1393,6 +1407,13 @@ func formatBytes(n uint64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f%ciB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+func formatLogFileDisplay(path string) string {
+	if strings.TrimSpace(path) == "" || path == "/dev/null" {
+		return "none"
+	}
+	return path
 }
 
 func normalizeLogPath(path string) string {
@@ -1546,9 +1567,6 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 		fmt.Printf("  %s\n", Red("Daemon mode: running in background"))
 	} else if expireStr != "" {
 		fmt.Printf("  %s\n", Dim("Press Ctrl+C to stop, or wait for expiry"))
-		fmt.Println()
-		// Initial expires line - no newline so countdown can overwrite
-		fmt.Printf("  %s %s   ", Dim("Expires in"), Yellow(expireStr))
 	} else {
 		fmt.Printf("  %s\n", Dim("Press Ctrl+C to stop"))
 	}
@@ -2089,7 +2107,8 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint) (*wsDiscoveryS
 		_ = conn.Close()
 		return nil, err
 	}
-	logrus.Debugf("wsd init: endpoint=%s xaddrs=%s scopes=%s", wsd.endpointAddress, strings.Join(wsd.xaddrs, ","), wsd.scopes)
+	logrus.Debugf("wsd init: ready (xaddrs=%d)", len(wsd.xaddrs))
+	logrus.Tracef("wsd init detail: endpoint=%s xaddrs=%s scopes=%s", wsd.endpointAddress, strings.Join(wsd.xaddrs, ","), wsd.scopes)
 	wsd.wg.Add(1)
 	go wsd.serve()
 	wsd.sendHello()
@@ -2130,7 +2149,7 @@ func (w *wsDiscoveryService) serve() {
 		action := xmlFieldValue(msg, "Action")
 		msgID := xmlFieldValue(msg, "MessageID")
 		if action != "" || msgID != "" {
-			logrus.Debugf("wsd recv: from=%s action=%s message_id=%s bytes=%d", src.String(), action, msgID, n)
+			logrus.Tracef("wsd recv: from=%s action=%s message_id=%s bytes=%d", src.String(), action, msgID, n)
 		} else {
 			logrus.Tracef("wsd recv: from=%s bytes=%d", src.String(), n)
 		}
@@ -2147,7 +2166,8 @@ func (w *wsDiscoveryService) serve() {
 			logrus.Debugf("wsd resolve: from=%s", src.String())
 			requestedEndpoint := xmlFieldValue(msg, "Address")
 			if requestedEndpoint != "" && !strings.EqualFold(requestedEndpoint, w.endpointAddress) {
-				logrus.Debugf("wsd resolve skip: from=%s requested=%s local=%s", src.String(), requestedEndpoint, w.endpointAddress)
+				logrus.Debugf("wsd resolve: ignored foreign endpoint from=%s", src.String())
+				logrus.Tracef("wsd resolve skip: from=%s requested=%s local=%s", src.String(), requestedEndpoint, w.endpointAddress)
 				continue
 			}
 			w.sendResolveMatch(src, xmlFieldValue(msg, "MessageID"))
@@ -2198,7 +2218,8 @@ func (w *wsDiscoveryService) sendHello() {
 </e:Body>
 </e:Envelope>`, randomUUIDURN(), appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
 	w.sendTo(w.multicastAddr, msg)
-	logrus.Debugf("wsd hello: endpoint=%s xaddrs=%s", w.endpointAddress, xaddrList)
+	logrus.Debugf("wsd hello: announced")
+	logrus.Tracef("wsd hello detail: endpoint=%s xaddrs=%s", w.endpointAddress, xaddrList)
 }
 
 func (w *wsDiscoveryService) sendBye() {
@@ -2218,7 +2239,8 @@ func (w *wsDiscoveryService) sendBye() {
 </e:Body>
 </e:Envelope>`, randomUUIDURN(), appSeq, w.endpointAddress)
 	w.sendTo(w.multicastAddr, msg)
-	logrus.Debugf("wsd bye: endpoint=%s", w.endpointAddress)
+	logrus.Debugf("wsd bye: announced")
+	logrus.Tracef("wsd bye detail: endpoint=%s", w.endpointAddress)
 }
 
 func (w *wsDiscoveryService) sendProbeMatch(dst *net.UDPAddr, relatesTo string) {
@@ -2254,7 +2276,8 @@ func (w *wsDiscoveryService) sendProbeMatch(dst *net.UDPAddr, relatesTo string) 
 </e:Body>
 </e:Envelope>`, randomUUIDURN(), rel, appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
 	w.sendTo(dst, msg)
-	logrus.Debugf("wsd probe match: to=%s relates_to=%s xaddrs=%s", dst.String(), relatesTo, xaddrList)
+	logrus.Debugf("wsd probe match: to=%s", dst.String())
+	logrus.Tracef("wsd probe match detail: to=%s relates_to=%s xaddrs=%s", dst.String(), relatesTo, xaddrList)
 }
 
 func (w *wsDiscoveryService) sendResolveMatch(dst *net.UDPAddr, relatesTo string) {
@@ -2290,7 +2313,8 @@ func (w *wsDiscoveryService) sendResolveMatch(dst *net.UDPAddr, relatesTo string
 </e:Body>
 </e:Envelope>`, randomUUIDURN(), rel, appSeq, w.endpointAddress, w.scopes, xaddrList, w.metadataVersion)
 	w.sendTo(dst, msg)
-	logrus.Debugf("wsd resolve match: to=%s relates_to=%s endpoint=%s xaddrs=%s", dst.String(), relatesTo, w.endpointAddress, xaddrList)
+	logrus.Debugf("wsd resolve match: to=%s", dst.String())
+	logrus.Tracef("wsd resolve match detail: to=%s relates_to=%s endpoint=%s xaddrs=%s", dst.String(), relatesTo, w.endpointAddress, xaddrList)
 }
 
 func (w *wsDiscoveryService) xaddrListFor(dst *net.UDPAddr) string {
@@ -2847,7 +2871,17 @@ func renderStatusBlock(st *daemonStatus) {
 	fmt.Printf("  %-12s %s\n", "Status", Green("daemon started"))
 	fmt.Printf("  %-12s %d\n", "PID", st.PID)
 	fmt.Printf("  %-12s %s\n", "PID file", st.PIDFile)
-	fmt.Printf("  %-12s %s\n", "Log file", st.LogFile)
+	fmt.Printf("  %-12s %s\n", "Log file", formatLogFileDisplay(st.LogFile))
+	if st.ExpiresAt != "" {
+		if expiry, err := time.Parse(time.RFC3339, st.ExpiresAt); err == nil {
+			remaining := time.Until(expiry)
+			if remaining > 0 {
+				fmt.Printf("  %-12s %s\n", "Expires in", Yellow(formatDuration(remaining)))
+			} else {
+				fmt.Printf("  %-12s %s\n", "Expires in", Red("expired"))
+			}
+		}
+	}
 }
 
 func statusDaemon() {

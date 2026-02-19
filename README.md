@@ -122,6 +122,11 @@ By default, sambam advertises the SMB service for LAN discovery using:
 - Bonjour/mDNS (`_smb._tcp`)
 - WS-Discovery (Windows Network discovery)
 
+Ports used by sambam:
+- `TCP 445` (SMB service)
+- `UDP 3702` (WS-Discovery probe/resolve)
+- `TCP 5357` (WS-Discovery metadata HTTP)
+
 Use `--no-advertise` to disable discovery announcements.
 
 ```bash
