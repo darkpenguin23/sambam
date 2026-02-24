@@ -1262,37 +1262,64 @@ func (r QueryDirectoryRequestDecoder) StructureSize() uint16 {
 }
 
 func (r QueryDirectoryRequestDecoder) FileInfoClass() uint8 {
+	if len(r) < 3 {
+		return 0
+	}
 	return r[2]
 }
 
 func (r QueryDirectoryRequestDecoder) Flags() uint8 {
+	if len(r) < 4 {
+		return 0
+	}
 	return r[3]
 }
 
 func (r QueryDirectoryRequestDecoder) FileIndex() uint32 {
+	if len(r) < 8 {
+		return 0
+	}
 	return le.Uint32(r[4:8])
 }
 
 func (r QueryDirectoryRequestDecoder) FileId() FileIdDecoder {
+	if len(r) < 24 {
+		return nil
+	}
 	return FileIdDecoder(r[8:24])
 }
 
 func (r QueryDirectoryRequestDecoder) FileNameOffset() uint16 {
+	if len(r) < 26 {
+		return 0
+	}
 	return le.Uint16(r[24:26])
 }
 
 func (r QueryDirectoryRequestDecoder) FileNameLength() uint16 {
+	if len(r) < 28 {
+		return 0
+	}
 	return le.Uint16(r[26:28])
 }
 
 func (r QueryDirectoryRequestDecoder) OutputBufferLength() uint32 {
+	if len(r) < 32 {
+		return 0
+	}
 	return le.Uint32(r[28:32])
 }
 
 func (r QueryDirectoryRequestDecoder) FileName() string {
-	off := r.FileNameOffset() - 64
-	len := r.FileNameLength()
-	return utf16le.DecodeToString(r[off : off+len])
+	off := int(r.FileNameOffset()) - 64
+	if off < 0 {
+		return ""
+	}
+	nameLen := int(r.FileNameLength())
+	if off+nameLen > len(r) {
+		return ""
+	}
+	return utf16le.DecodeToString(r[off : off+nameLen])
 }
 
 // ----------------------------------------------------------------------------

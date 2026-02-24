@@ -707,6 +707,15 @@ func (t *fileTree) readEA(ctx *compoundContext, fileId *FileId, open *Open, pkt 
 	c := t.session.conn
 	log.Tracef("readEA req: file=%s stream=%s off=%d len=%d", open.pathName, open.eaKey, off, length)
 
+	// macOS TextEdit has been observed crashing while consuming
+	// com.apple.TextEncoding over SMB in some OS builds.
+	// Returning "not found" makes the client fall back to content sniffing.
+	if strings.EqualFold(c.clientOS, "macOS") && strings.EqualFold(open.eaKey, "com.apple.TextEncoding") {
+		rsp := new(ErrorResponse)
+		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_OBJECT_NAME_NOT_FOUND))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+
 	status := uint32(0) //STATUS_END_OF_FILE
 	total, err := t.fs.Getxattr(vfs.VfsHandle(fileId.HandleId()), open.eaKey, nil)
 	n := 0
@@ -1431,8 +1440,20 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 
 	c := t.session.conn
 
-	res, _ := accept(SMB2_QUERY_DIRECTORY, pkt)
+	res, err := accept(SMB2_QUERY_DIRECTORY, pkt)
+	if err != nil {
+		log.Errorf("queryDirectory: invalid request: %v", err)
+		rsp := new(ErrorResponse)
+		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_INVALID_PARAMETER))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 	r := QueryDirectoryRequestDecoder(res)
+	if r.IsInvalid() {
+		log.Errorf("queryDirectory: malformed request payload")
+		rsp := new(ErrorResponse)
+		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_INVALID_PARAMETER))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 
 	switch r.FileInfoClass() {
 	case FileIdBothDirectoryInformation, FileFullDirectoryInformation, FileNamesInformation,

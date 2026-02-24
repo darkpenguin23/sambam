@@ -92,3 +92,39 @@ func TestTryDecryptRejectsTransformAlgorithmMismatch(t *testing.T) {
 		t.Fatalf("expected decrypt validation error for algorithm mismatch")
 	}
 }
+
+func TestTryVerifyAllowsSlicedCompoundHeaderWhenUnsigned(t *testing.T) {
+	// First request of a compound chain, sliced to NextCommand bytes.
+	seg := make([]byte, 128)
+	p := PacketCodec(seg)
+	p.SetProtocolId()
+	p.SetStructureSize()
+	p.SetCommand(SMB2_CREATE)
+	p.SetMessageId(11)
+	p.SetSessionId(0x55)
+	p.SetNextCommand(128) // Valid in full-frame context; equals sliced length.
+
+	c := &conn{
+		requireSigning: false,
+		sessions:       map[uint64]*session{},
+	}
+
+	if err := c.tryVerify(seg, false); err != nil {
+		t.Fatalf("unexpected verify error for sliced compound segment: %v", err)
+	}
+}
+
+func TestAcceptAllowsSlicedCompoundFirstSegment(t *testing.T) {
+	seg := make([]byte, 128)
+	p := PacketCodec(seg)
+	p.SetProtocolId()
+	p.SetStructureSize()
+	p.SetCommand(SMB2_QUERY_INFO)
+	p.SetMessageId(77)
+	p.SetSessionId(0x77)
+	p.SetNextCommand(128) // valid when this is a sliced first compound segment
+
+	if _, err := accept(SMB2_QUERY_INFO, seg); err != nil {
+		t.Fatalf("unexpected accept error for sliced compound segment: %v", err)
+	}
+}

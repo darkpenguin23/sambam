@@ -745,7 +745,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.35"
+	version = "1.4.36"
 )
 
 func main() {
@@ -1364,6 +1364,10 @@ func main() {
 		}
 	}
 
+	var openLogMu sync.Mutex
+	openLogLast := map[string]time.Time{}
+	openLogDedupWindow := 800 * time.Millisecond
+
 	// Create filesystems for all shares
 	vfsShares := make(map[string]vfs.VFSFileSystem)
 	for _, share := range shares {
@@ -1373,6 +1377,16 @@ func main() {
 		if extraVerbose {
 			fs.OnOpen = func(path string, mode string) {
 				path = normalizeLogPath(path)
+				key := path + "\x00" + mode
+				now := time.Now()
+				openLogMu.Lock()
+				last, ok := openLogLast[key]
+				if ok && now.Sub(last) < openLogDedupWindow {
+					openLogMu.Unlock()
+					return
+				}
+				openLogLast[key] = now
+				openLogMu.Unlock()
 				logrus.Infof("open: %s (%s)", path, mode)
 			}
 			fs.OnRead = func(path string) {

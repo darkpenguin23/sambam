@@ -559,7 +559,13 @@ exit:
 
 func accept(cmd uint16, pkt []byte) (res []byte, err error) {
 	p := PacketCodec(pkt)
-	if p.IsInvalid() {
+	if len(pkt) < 64 {
+		return nil, &InvalidResponseError{"broken packet header format"}
+	}
+	if p.IsSmb1() {
+		return nil, &InvalidResponseError{"broken packet header format"}
+	}
+	if p.StructureSize() != 64 {
 		return nil, &InvalidResponseError{"broken packet header format"}
 	}
 	if command := p.Command(); cmd != command {
@@ -749,7 +755,13 @@ func cipherName(id uint16) string {
 
 func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 	p := PacketCodec(pkt)
-	if p.IsInvalid() {
+	if len(pkt) < 64 {
+		return &InvalidResponseError{"broken packet header format"}
+	}
+	if p.IsSmb1() {
+		return &InvalidResponseError{"broken packet header format"}
+	}
+	if p.StructureSize() != 64 {
 		return &InvalidResponseError{"broken packet header format"}
 	}
 
