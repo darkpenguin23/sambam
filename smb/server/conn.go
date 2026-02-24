@@ -451,8 +451,14 @@ func (conn *conn) runReciever() {
 
 				continue
 			}
+		}
+		if e = validateSMB2CompoundFrame(pkt); e != nil {
+			conn.warnf("skip: %v", e)
+			continue
+		}
 
-			p := PacketCodec(pkt)
+		p := PacketCodec(pkt)
+		if hasSession {
 			if p.Command() != SMB2_NEGOTIATE &&
 				p.Command() != SMB2_SESSION_SETUP &&
 				p.Command() != SMB2_ECHO {
@@ -553,6 +559,9 @@ exit:
 
 func accept(cmd uint16, pkt []byte) (res []byte, err error) {
 	p := PacketCodec(pkt)
+	if p.IsInvalid() {
+		return nil, &InvalidResponseError{"broken packet header format"}
+	}
 	if command := p.Command(); cmd != command {
 		return nil, &InvalidResponseError{fmt.Sprintf("expected command: %v, got %v", cmd, command)}
 	}
@@ -642,13 +651,31 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 			return nil, &InvalidResponseError{"broken packet header format"}, false
 		}
 
-		if t.Flags() != Encrypted {
-			return nil, &InvalidResponseError{"encrypted flag is not on"}, false
-		}
-
 		s := conn.getSession(t.SessionId())
 		if s == nil {
 			return nil, &InvalidResponseError{"unknown session id returned"}, false
+		}
+		if len(pkt) < 52+16 {
+			return nil, &InvalidResponseError{"truncated transform packet"}, false
+		}
+		if t.OriginalMessageSize() == 0 || int(t.OriginalMessageSize()) > maxDirectTCPSize {
+			return nil, &InvalidResponseError{"invalid transform original message size"}, false
+		}
+		if conn.dialect == SMB311 {
+			if t.Flags() != Encrypted {
+				return nil, &InvalidResponseError{"encrypted flag is not on"}, false
+			}
+		} else {
+			alg := t.EncryptionAlgorithm()
+			switch alg {
+			case AES128CCM, AES128GCM:
+			default:
+				return nil, &InvalidResponseError{"unsupported transform encryption algorithm"}, false
+			}
+			// If a session selected a specific cipher, enforce consistency.
+			if s.cipherId != 0 && alg != s.cipherId {
+				return nil, &InvalidResponseError{"transform algorithm does not match session cipher"}, false
+			}
 		}
 
 		pkt, err := s.decrypt(pkt)
@@ -664,11 +691,49 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 			)
 			return nil, &InvalidResponseError{err.Error()}, false
 		}
+		if len(pkt) != int(t.OriginalMessageSize()) {
+			return nil, &InvalidResponseError{"decrypted payload size mismatch"}, false
+		}
+		if PacketCodec(pkt).IsInvalid() {
+			return nil, &InvalidResponseError{"broken decrypted packet header format"}, false
+		}
 
 		return pkt, nil, true
 	}
 
 	return pkt, nil, false
+}
+
+func validateSMB2CompoundFrame(pkt []byte) error {
+	if len(pkt) < 64 {
+		return &InvalidResponseError{"broken packet header format"}
+	}
+
+	cur := pkt
+	parts := 0
+	maxParts := len(pkt)/64 + 1
+
+	for {
+		p := PacketCodec(cur)
+		if p.IsInvalid() {
+			return &InvalidResponseError{"broken packet header format"}
+		}
+
+		parts++
+		if parts > maxParts {
+			return &InvalidResponseError{"too many compound requests"}
+		}
+
+		off := p.NextCommand()
+		if off == 0 {
+			return nil
+		}
+		if off < 64 || int(off) > len(cur)-64 {
+			return &InvalidResponseError{"invalid compound next-command offset"}
+		}
+
+		cur = cur[off:]
+	}
 }
 
 func cipherName(id uint16) string {
@@ -684,6 +749,9 @@ func cipherName(id uint16) string {
 
 func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
 	p := PacketCodec(pkt)
+	if p.IsInvalid() {
+		return &InvalidResponseError{"broken packet header format"}
+	}
 
 	msgId := p.MessageId()
 

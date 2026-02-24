@@ -52,6 +52,9 @@ func (s *session) verify(pkt []byte) (ok bool) {
 	p.SetSignature(zero[:])
 
 	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
+		if s.verifier == nil {
+			return false
+		}
 		h := s.verifier
 
 		h.Reset()

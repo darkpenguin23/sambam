@@ -65,7 +65,11 @@ type Packet interface {
 type PacketCodec []byte
 
 func (p PacketCodec) IsInvalid() bool {
-	if p.IsSmb1() && p.Command() == SMB_COM_NEGOTIATE {
+	if len(p) < 4 {
+		return true
+	}
+
+	if len(p) >= 5 && p.IsSmb1() && p.Command() == SMB_COM_NEGOTIATE {
 		return false
 	}
 
@@ -91,11 +95,21 @@ func (p PacketCodec) IsInvalid() bool {
 		return true
 	}
 
-	if p.NextCommand()&7 != 0 {
+	next := p.NextCommand()
+	if next&7 != 0 {
 		return true
 	}
-	if int(p.NextCommand()) >= len(p) {
-		return true
+	if next != 0 {
+		// Non-zero NextCommand must point to a full SMB2 header boundary.
+		if next < 64 {
+			return true
+		}
+		if int(next) >= len(p) {
+			return true
+		}
+		if len(p)-int(next) < 64 {
+			return true
+		}
 	}
 
 	return false
@@ -114,6 +128,10 @@ func (p PacketCodec) IsCompoundLast() bool {
 }
 
 func (p PacketCodec) IsSmb1() bool {
+	if len(p) < 4 {
+		return false
+	}
+
 	magic := p.ProtocolId()
 	if magic[0] != 0xff {
 		return false
@@ -164,7 +182,13 @@ func (p PacketCodec) SetStatus(u uint32) {
 
 func (p PacketCodec) Command() uint16 {
 	if p.IsSmb1() {
+		if len(p) < 5 {
+			return 0
+		}
 		return uint16(p[4])
+	}
+	if len(p) < 14 {
+		return 0
 	}
 	return le.Uint16(p[12:14])
 }
@@ -271,7 +295,8 @@ func (p PacketCodec) SetChannelSequence(u uint16) {
 type TransformCodec []byte
 
 func (p TransformCodec) IsInvalid() bool {
-	if len(p) < 52 {
+	// TRANSFORM_HEADER (52) + encrypted SMB2 payload (at least SMB2 header size 64)
+	if len(p) < 52+64 {
 		return true
 	}
 
@@ -286,6 +311,9 @@ func (p TransformCodec) IsInvalid() bool {
 		return true
 	}
 	if magic[3] != 'B' {
+		return true
+	}
+	if p.OriginalMessageSize() < 64 {
 		return true
 	}
 
