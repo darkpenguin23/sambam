@@ -70,6 +70,7 @@ type userFieldMask struct {
 type Config struct {
 	Listen            string
 	ListenAddrs       []string
+	SMB3Encryption    bool
 	Advertise         bool
 	DiscoveryNameMDNS string
 	DiscoveryNameWSD  string
@@ -163,7 +164,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	}
 
 	legacyRoots := []string{
-		"listen", "listen_addrs", "allow", "advertise", "discovery_name_mdns", "discovery_name_wsd", "readonly",
+		"listen", "listen_addrs", "allow", "smb3_encryption", "advertise", "discovery_name_mdns", "discovery_name_wsd", "readonly",
 		"verbose", "verbose_level", "debug", "trace", "hide_dotfiles",
 		"expire", "pidfile", "logfile", "users", "shares", "username", "password",
 	}
@@ -220,6 +221,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 			return nil, md, fmt.Errorf("invalid [global] section")
 		}
 		type globalConfig struct {
+			SMB3Encryption    bool   `toml:"smb3_encryption"`
 			Advertise         bool   `toml:"advertise"`
 			DiscoveryNameMDNS string `toml:"discovery_name_mdns"`
 			DiscoveryNameWSD  string `toml:"discovery_name_wsd"`
@@ -237,6 +239,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		if err := md.PrimitiveDecode(raw.Global, &gcfg); err != nil {
 			return nil, md, fmt.Errorf("invalid [global] section")
 		}
+		cfg.SMB3Encryption = gcfg.SMB3Encryption
 		cfg.Advertise = gcfg.Advertise
 		cfg.DiscoveryNameMDNS = gcfg.DiscoveryNameMDNS
 		cfg.DiscoveryNameWSD = gcfg.DiscoveryNameWSD
@@ -342,6 +345,9 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	if md.IsDefined("global", "listen") {
 		dst.Listen = src.Listen
 		dst.ListenAddrs = append([]string(nil), src.ListenAddrs...)
+	}
+	if md.IsDefined("global", "smb3_encryption") {
+		dst.SMB3Encryption = src.SMB3Encryption
 	}
 	if md.IsDefined("global", "advertise") {
 		dst.Advertise = src.Advertise
@@ -454,6 +460,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("global", "listen") {
 		record("listen")
 	}
+	if md.IsDefined("global", "smb3_encryption") {
+		record("smb3_encryption")
+	}
 	if md.IsDefined("global", "advertise") {
 		record("advertise")
 	}
@@ -529,6 +538,8 @@ func configValueString(cfg *Config, key string) string {
 	switch key {
 	case "listen":
 		return cfg.Listen
+	case "smb3_encryption":
+		return strconv.FormatBool(cfg.SMB3Encryption)
 	case "advertise":
 		return strconv.FormatBool(cfg.Advertise)
 	case "discovery_name_mdns":
@@ -734,7 +745,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.33"
+	version = "1.4.34"
 )
 
 func main() {
@@ -831,6 +842,16 @@ func main() {
 
 	if len(*listenAddrs) == 0 {
 		*listenAddrs = []string{"0.0.0.0:445"}
+	}
+	enableSMB3Encryption := true
+	if config != nil {
+		if _, ok := configInfo.SettingSrc["smb3_encryption"]; ok {
+			enableSMB3Encryption = config.SMB3Encryption
+		}
+	}
+	// Backward-compatible environment override.
+	if v := strings.TrimSpace(os.Getenv("SAMBAM_ENABLE_SMB3_ENCRYPTION")); v != "" {
+		enableSMB3Encryption = normalize_bool_env(v)
 	}
 	advertiseEnabled := true
 	if config != nil {
@@ -1450,13 +1471,14 @@ func main() {
 	// Create server
 	srv := smb2.NewServer(
 		&smb2.ServerConfig{
-			AllowGuest:      allowGuest,
-			Xatrrs:          true,
-			HideDotfiles:    *hideDotfiles,
-			ShareGuest:      shareGuest,
-			ShareAllowUsers: shareAllowUsers,
-			AuthUsers:       authUserNames,
-			UserReadonly:    userReadonly,
+			AllowGuest:           allowGuest,
+			EnableSMB3Encryption: enableSMB3Encryption,
+			Xatrrs:               true,
+			HideDotfiles:         *hideDotfiles,
+			ShareGuest:           shareGuest,
+			ShareAllowUsers:      shareAllowUsers,
+			AuthUsers:            authUserNames,
+			UserReadonly:         userReadonly,
 			AllowConn: func(remoteAddr string) bool {
 				return isRemoteAllowed(remoteAddr, allowNets)
 			},
@@ -1608,6 +1630,15 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%ds", s)
 }
 
+func normalize_bool_env(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func formatBytes(n uint64) string {
 	const unit = 1024
 	if n < unit {
@@ -1635,6 +1666,14 @@ func normalizeLogPath(path string) string {
 	return path
 }
 
+func formatSharesInline(shares []Share) string {
+	parts := make([]string, 0, len(shares))
+	for _, share := range shares {
+		parts = append(parts, fmt.Sprintf("%s %s %s", Yellow(share.Name), Dim("→"), Green(share.Path)))
+	}
+	return strings.Join(parts, Dim(", "))
+}
+
 func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuffix string, allowAddrs []string, authText string, authMount string, expireStr string, daemonMode bool, extendedConnect bool) {
 	fmt.Println()
 	fmt.Printf("  %s %s\n", CyanBold("sambam v"+version), Dim("(built with AI assistance)"))
@@ -1645,21 +1684,7 @@ func printBanner(shares []Share, listenAddr string, displayIPs []string, portSuf
 		fmt.Printf("  %-12s %s\n", "Sharing", Green(shares[0].Path))
 		fmt.Printf("  %-12s %s\n", "Share", Yellow(shares[0].Name))
 	} else {
-		// Find longest share name for alignment
-		maxLen := 0
-		for _, share := range shares {
-			if len(share.Name) > maxLen {
-				maxLen = len(share.Name)
-			}
-		}
-		if maxLen < 11 {
-			maxLen = 11
-		}
-		fmt.Printf("  %s\n", "Shares:")
-		for _, share := range shares {
-			padding := strings.Repeat(" ", maxLen-len(share.Name))
-			fmt.Printf("    %s%s %s %s\n", Yellow(share.Name), padding, Dim("→"), Green(share.Path))
-		}
+		fmt.Printf("  %-12s %s\n", "Shares", formatSharesInline(shares))
 	}
 
 	listenHost, _ := parseHostPort(listenAddr)
@@ -1877,6 +1902,8 @@ func writeGeneratedConfig(target string, listenAddrs []string, allowAddrs []stri
 	globalStarted := false
 	b.WriteString("# sambam generated configuration\n")
 	b.WriteString("# CLI flags override these settings.\n\n")
+	b.WriteString("# SMB3 encryption is enabled by default when supported by the client.\n")
+	b.WriteString("# Set [global].smb3_encryption = false only for compatibility troubleshooting.\n\n")
 
 	startGlobal := func() {
 		if globalStarted {
@@ -3069,20 +3096,7 @@ func renderStatusBlock(st *daemonStatus) {
 		fmt.Printf("  %-12s %s\n", "Sharing", Green(st.Shares[0].Path))
 		fmt.Printf("  %-12s %s\n", "Share", Yellow(st.Shares[0].Name))
 	} else {
-		maxLen := 0
-		for _, share := range st.Shares {
-			if len(share.Name) > maxLen {
-				maxLen = len(share.Name)
-			}
-		}
-		if maxLen < 11 {
-			maxLen = 11
-		}
-		fmt.Printf("  %s\n", "Shares:")
-		for _, share := range st.Shares {
-			padding := strings.Repeat(" ", maxLen-len(share.Name))
-			fmt.Printf("    %s%s %s %s\n", Yellow(share.Name), padding, Dim("→"), Green(share.Path))
-		}
+		fmt.Printf("  %-12s %s\n", "Shares", formatSharesInline(st.Shares))
 	}
 
 	listenColored := Yellow(st.Listen)

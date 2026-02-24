@@ -12,6 +12,9 @@ allow = ["10.23.0.0/16"]
 
 # Advertise SMB share via mDNS (_smb._tcp) + WS-Discovery
 advertise = true
+# SMB3 encryption is enabled by default (when client supports it).
+# Set to false only for compatibility troubleshooting.
+smb3_encryption = true
 # Friendly discovery names shown to clients.
 # mDNS (macOS Finder) default when omitted: "<hostname>-sambam"
 # WSD (Windows Network) default when omitted: "<hostname>"

@@ -332,7 +332,7 @@ func (conn *conn) resetSession() {
 	atomic.StoreInt32(&conn._useSession, 0)
 }
 
-func (conn *conn) encodePacket(req Packet, tc *treeConn, ctx context.Context) ([]byte, error) {
+func (conn *conn) encodePacketRaw(req Packet, tc *treeConn) ([]byte, error) {
 	var err error
 	hdr := req.Header()
 
@@ -366,8 +366,27 @@ func (conn *conn) encodePacket(req Packet, tc *treeConn, ctx context.Context) ([
 
 	req.Encode(pkt)
 
+	return pkt, err
+}
+
+func (conn *conn) protectPacket(pkt []byte, tc *treeConn) ([]byte, error) {
+	var err error
+	s := conn.session
+
 	if s != nil {
-		if _, ok := req.(*SessionSetupRequest); !ok {
+		// SESSION_SETUP messages must remain plaintext; however, the final
+		// SessionSetup response is signed for authenticated sessions.
+		hdr := PacketCodec(pkt)
+		if hdr.IsInvalid() {
+			return nil, &InvalidResponseError{"broken packet header format"}
+		}
+		if hdr.Command() == SMB2_SESSION_SETUP {
+			if hdr.Flags()&SMB2_FLAGS_SERVER_TO_REDIR != 0 &&
+				s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 &&
+				s.signer != nil {
+				pkt = s.sign(pkt)
+			}
+		} else {
 			if s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 || (tc != nil && tc.shareFlags&SMB2_SHAREFLAG_ENCRYPT_DATA != 0) {
 				pkt, err = s.encrypt(pkt)
 				if err != nil {
@@ -634,6 +653,15 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 
 		pkt, err := s.decrypt(pkt)
 		if err != nil {
+			conn.warnf(
+				"decrypt failed: sid=%d flags=0x%x orig=%d cipher=%s nonceLen=%d err=%v",
+				t.SessionId(),
+				t.Flags(),
+				t.OriginalMessageSize(),
+				cipherName(s.cipherId),
+				s.decrypter.NonceSize(),
+				err,
+			)
 			return nil, &InvalidResponseError{err.Error()}, false
 		}
 
@@ -641,6 +669,17 @@ func (conn *conn) tryDecrypt(pkt []byte) ([]byte, error, bool) {
 	}
 
 	return pkt, nil, false
+}
+
+func cipherName(id uint16) string {
+	switch id {
+	case AES128CCM:
+		return "AES-128-CCM"
+	case AES128GCM:
+		return "AES-128-GCM"
+	default:
+		return fmt.Sprintf("unknown(0x%x)", id)
+	}
 }
 
 func (conn *conn) tryVerify(pkt []byte, isEncrypted bool) error {
@@ -702,7 +741,9 @@ func (conn *conn) sendPacket(req Packet, tc *treeConn, compCtx *compoundContext)
 		}
 	}
 
-	pkt, err := conn.encodePacket(req, tc, conn.ctx)
+	var pkt []byte
+	var err error
+	pkt, err = conn.encodePacketRaw(req, tc)
 	if err != nil {
 		conn.m.Unlock()
 		return err
@@ -738,6 +779,12 @@ func (conn *conn) sendPacket(req Packet, tc *treeConn, compCtx *compoundContext)
 		}
 		pkt = make([]byte, compCtx.Size())
 		compCtx.Encode(pkt)
+	}
+
+	pkt, err = conn.protectPacket(pkt, tc)
+	if err != nil {
+		conn.m.Unlock()
+		return err
 	}
 
 	switch conn.serverState {

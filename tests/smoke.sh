@@ -3,7 +3,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT_DIR}/sambam"
-TMP_BASE="${TMPDIR:-/tmp}/sambam-smoke-$$"
+TMP_BASE="${TMPDIR:-/tmp}/sambam-smoke"
+SMOKE_VERBOSE_FLAGS="${SMOKE_VERBOSE_FLAGS:-}"
+
+SMOKE_VERBOSE_ARGS=()
+if [[ -n "${SMOKE_VERBOSE_FLAGS}" ]]; then
+  # shellcheck disable=SC2206
+  SMOKE_VERBOSE_ARGS=( ${SMOKE_VERBOSE_FLAGS} )
+fi
 
 PASS=0
 FAIL=0
@@ -21,11 +28,7 @@ else
   C_RESET=""
 fi
 
-cleanup() {
-  rm -rf "${TMP_BASE}"
-}
-trap cleanup EXIT
-
+rm -rf "${TMP_BASE}"
 mkdir -p "${TMP_BASE}"
 
 ok() {
@@ -200,6 +203,21 @@ else
     return 1
   }
 
+  mount_auth_share() {
+    local port="$1"
+    local opts
+    for opts in \
+      "username=smokeuser,password=smokepass,port=${port},vers=3.1.1,seal" \
+      "username=smokeuser,password=smokepass,port=${port},vers=3.1.1" \
+      "username=smokeuser,password=smokepass,port=${port},vers=3.0,seal" \
+      "username=smokeuser,password=smokepass,port=${port},vers=3.0"; do
+      if timeout 20s mount -t cifs //127.0.0.1/smoke "${MNT_DIR}" -o "${opts}" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
+    return 1
+  }
+
   is_mfsymlink_file() {
     local path="$1"
     [[ -f "${path}" ]] || return 1
@@ -218,7 +236,7 @@ path = "${SRC_DIR}"
 allow_users = ["guest"]
 EOF
 
-  "${BIN}" -c "${CFG_FILE}" -L "${LOG_FILE}" >/dev/null 2>&1 &
+  "${BIN}" -c "${CFG_FILE}" -L "${LOG_FILE}" "${SMOKE_VERBOSE_ARGS[@]}" >/dev/null 2>&1 &
   SRV_PID=$!
   sleep 1
   if ! kill -0 "${SRV_PID}" 2>/dev/null; then
@@ -310,7 +328,7 @@ path = "${SRC_DIR}"
 allow_users = ["guest"]
 EOF
 
-  "${BIN}" -c "${RO_CFG_FILE}" -L "${RO_LOG_FILE}" >/dev/null 2>&1 &
+  "${BIN}" -c "${RO_CFG_FILE}" -L "${RO_LOG_FILE}" "${SMOKE_VERBOSE_ARGS[@]}" >/dev/null 2>&1 &
   RO_SRV_PID=$!
   sleep 1
   if ! kill -0 "${RO_SRV_PID}" 2>/dev/null; then
@@ -343,13 +361,13 @@ path = "${SRC_DIR}"
 allow_users = ["smokeuser"]
 EOF
 
-  "${BIN}" -c "${AUTH_CFG_FILE}" -L "${AUTH_LOG_FILE}" >/dev/null 2>&1 &
+  "${BIN}" -c "${AUTH_CFG_FILE}" -L "${AUTH_LOG_FILE}" "${SMOKE_VERBOSE_ARGS[@]}" >/dev/null 2>&1 &
   AUTH_SRV_PID=$!
   sleep 1
   if ! kill -0 "${AUTH_SRV_PID}" 2>/dev/null; then
     skip "linux authenticated integration (server failed to start)"
   else
-    if mount -t cifs //127.0.0.1/smoke "${MNT_DIR}" -o username=smokeuser,password=smokepass,port=14448,vers=3.1.1 >/dev/null 2>&1; then
+    if mount_auth_share 14448; then
       if [[ -f "${MNT_DIR}/hello.txt" ]] && grep -Fq "hello-smoke" "${MNT_DIR}/hello.txt"; then
         ok "linux authenticated mount"
       else
@@ -358,6 +376,7 @@ EOF
       umount "${MNT_DIR}" >/dev/null 2>&1 || true
     else
       skip "linux authenticated integration (mount failed in this environment)"
+      sed -n '1,80p' "${AUTH_LOG_FILE}" >/dev/null 2>&1 || true
     fi
   fi
   kill -INT "${AUTH_SRV_PID}" >/dev/null 2>&1 || true

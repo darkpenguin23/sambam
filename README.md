@@ -35,6 +35,7 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[user.<name>]` config
 - **Multiple shares** - Share multiple directories with different names
 - **Per-share access control** - `allow_users` and share-level `readonly` in config
+- **SMB3 encryption by default** - Automatically used when the client supports it
 - **Auto-expire** - Automatically stop sharing after a set time
 - **Config file** - Layered defaults, or explicit `-c` config-only mode
 - **Cross-platform clients** - Works with Windows 10/11, macOS, and Linux (CIFS mount)
@@ -297,6 +298,7 @@ listen = "0.0.0.0:445"
 
 allow = ["10.23.0.0/16"]
 advertise = true
+smb3_encryption = true
 discovery_name_mdns = "sambam-dev-sambam"
 discovery_name_wsd = "sambam-dev"
 readonly = false
@@ -340,6 +342,7 @@ Global options:
 - `listen` (string or array)
 - `allow`
 - `advertise` (default: `true`)
+- `smb3_encryption` (default: `true`; used when client supports SMB3 encryption)
 - `discovery_name_mdns` (default: `<hostname>-sambam`)
 - `discovery_name_wsd` (default: `<hostname>`)
 - `hide_dotfiles`
@@ -362,6 +365,7 @@ Notes:
 - `allow_users = ["guest"]` creates a guest-only (anonymous) share.
 - `allow_users = ["alice", "bob"]` restricts a share to specific authenticated users.
 - `allow_users = ["guest", "alice"]` allows both guest and selected users.
+- `smb3_encryption` is enabled by default. Set `smb3_encryption = false` only for compatibility troubleshooting.
 
 See `sambamrc.example` for a full example.
 

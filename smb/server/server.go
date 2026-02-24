@@ -49,7 +49,8 @@ type Server struct {
 	opens       map[uint64]*Open
 	opensByGuid map[Guid]*Open
 
-	allowGuest bool
+	allowGuest           bool
+	enableSMB3Encryption bool
 
 	maxIOReads  int
 	maxIOWrites int
@@ -166,23 +167,24 @@ var (
 )
 
 type ServerConfig struct {
-	AllowGuest       bool
-	MaxIOReads       int
-	MaxIOWrites      int
-	Xatrrs           bool
-	IgnoreSetAttrErr bool
-	AcceptSingleConn bool
-	HideDotfiles     bool                              // Hide files starting with '.'
-	ShareGuest       map[string]bool                   // share -> allow guest access
-	ShareAllowUsers  map[string][]string               // share -> allowed usernames (empty => all)
-	AuthUsers        []string                          // configured authenticated users
-	UserReadonly     map[string]bool                   // username(lowercase) -> readonly
-	AllowConn        func(remoteAddr string) bool      // Return true to allow a client connection
-	OnReject         func(remoteAddr string)           // Called when a client is rejected by allow policy
-	OnConnect        func(remoteAddr string)           // Called when a client connects
-	OnRename         func(from, to string)             // Called on file rename
-	OnDetect         func(action, path string)         // Called on fsnotify event
-	OnAuthFail       func(remoteAddr, username string) // Called on auth failure
+	AllowGuest           bool
+	EnableSMB3Encryption bool
+	MaxIOReads           int
+	MaxIOWrites          int
+	Xatrrs               bool
+	IgnoreSetAttrErr     bool
+	AcceptSingleConn     bool
+	HideDotfiles         bool                              // Hide files starting with '.'
+	ShareGuest           map[string]bool                   // share -> allow guest access
+	ShareAllowUsers      map[string][]string               // share -> allowed usernames (empty => all)
+	AuthUsers            []string                          // configured authenticated users
+	UserReadonly         map[string]bool                   // username(lowercase) -> readonly
+	AllowConn            func(remoteAddr string) bool      // Return true to allow a client connection
+	OnReject             func(remoteAddr string)           // Called when a client is rejected by allow policy
+	OnConnect            func(remoteAddr string)           // Called when a client connects
+	OnRename             func(from, to string)             // Called on file rename
+	OnDetect             func(action, path string)         // Called on fsnotify event
+	OnAuthFail           func(remoteAddr, username string) // Called on auth failure
 }
 
 func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFileSystem) *Server {
@@ -225,30 +227,31 @@ func NewServer(cfg *ServerConfig, a Authenticator, shares map[string]vfs.VFSFile
 	}
 
 	srv := &Server{
-		authenticator:    a,
-		shares:           newShares,
-		origShares:       shares,
-		shareGuest:       shareGuest,
-		shareUsers:       shareUsers,
-		authUsers:        authUsers,
-		userRO:           userRO,
-		opens:            map[uint64]*Open{},
-		allowGuest:       cfg.AllowGuest,
-		maxIOReads:       cfg.MaxIOReads,
-		maxIOWrites:      cfg.MaxIOWrites,
-		xattrs:           cfg.Xatrrs,
-		ignoreSetAttrErr: cfg.IgnoreSetAttrErr,
-		hideDotfiles:     cfg.HideDotfiles,
-		activeConns:      map[*conn]struct{}{},
-		acceptSingleConn: cfg.AcceptSingleConn,
-		allowConn:        cfg.AllowConn,
-		onReject:         cfg.OnReject,
-		onConnect:        cfg.OnConnect,
-		onRename:         cfg.OnRename,
-		onDetect:         cfg.OnDetect,
-		onAuthFail:       cfg.OnAuthFail,
-		fsWatchRefs:      map[string]int{},
-		fsWatchRoot:      map[string]string{},
+		authenticator:        a,
+		shares:               newShares,
+		origShares:           shares,
+		shareGuest:           shareGuest,
+		shareUsers:           shareUsers,
+		authUsers:            authUsers,
+		userRO:               userRO,
+		opens:                map[uint64]*Open{},
+		allowGuest:           cfg.AllowGuest,
+		enableSMB3Encryption: cfg.EnableSMB3Encryption,
+		maxIOReads:           cfg.MaxIOReads,
+		maxIOWrites:          cfg.MaxIOWrites,
+		xattrs:               cfg.Xatrrs,
+		ignoreSetAttrErr:     cfg.IgnoreSetAttrErr,
+		hideDotfiles:         cfg.HideDotfiles,
+		activeConns:          map[*conn]struct{}{},
+		acceptSingleConn:     cfg.AcceptSingleConn,
+		allowConn:            cfg.AllowConn,
+		onReject:             cfg.OnReject,
+		onConnect:            cfg.OnConnect,
+		onRename:             cfg.OnRename,
+		onDetect:             cfg.OnDetect,
+		onAuthFail:           cfg.OnAuthFail,
+		fsWatchRefs:          map[string]int{},
+		fsWatchRoot:          map[string]string{},
 	}
 
 	if w, err := fsnotify.NewWatcher(); err == nil {
@@ -975,16 +978,24 @@ func (n *ServerNegotiator) makeResponse(conn *conn) (*NegotiateResponse, error) 
 	} else {
 		rsp.DialectRevision = defaultDerverDialect
 
+		hashID := conn.hashId
+		if hashID == 0 {
+			hashID = SHA512
+		}
 		hc := &HashContext{
-			HashAlgorithms: clientHashAlgorithms,
+			HashAlgorithms: []uint16{hashID},
 			HashSalt:       make([]byte, 32),
 		}
 		if _, err := rand.Read(hc.HashSalt); err != nil {
 			return nil, &InternalError{err.Error()}
 		}
 
+		cipherID := conn.cipherId
+		if cipherID == 0 {
+			cipherID = AES128GCM
+		}
 		cc := &CipherContext{
-			Ciphers: clientCiphers,
+			Ciphers: []uint16{cipherID},
 		}
 
 		rsp.Contexts = append(rsp.Contexts, hc, cc)
@@ -1032,6 +1043,16 @@ func authFailedUserFromError(err error) string {
 		return strings.TrimSpace(strings.TrimPrefix(msg, p))
 	}
 	return ""
+}
+
+func (c *conn) shouldEncryptSession() bool {
+	if c.serverCtx == nil || !c.serverCtx.enableSMB3Encryption {
+		return false
+	}
+	if c.dialect < SMB300 {
+		return false
+	}
+	return c.capabilities&SMB2_GLOBAL_CAP_ENCRYPTION != 0
 }
 
 func (c *conn) calcPreauthHash(pkt []byte) {
@@ -1142,6 +1163,9 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 	flags := uint16(0)
 	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
 		flags = SMB2_SESSION_FLAG_IS_GUEST
+	} else if c.shouldEncryptSession() {
+		flags |= SMB2_SESSION_FLAG_ENCRYPT_DATA
+		c.infof("session security: encryption=enabled cipher=%s", cipherName(c.cipherId))
 	}
 
 	sessionId := p.SessionId()
@@ -1172,16 +1196,12 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		}
 	}
 
-	// We set session before sending packet just for setting hdr.SessionId.
-	// But, we should not permit access from receiver until the session information is completed.
+	// Set session before sending final SESSION_SETUP so response can be signed.
 	c.setSession(s)
-
 	c.serverState = STATE_SESSION_ACTIVE
 	if err = c.sendPacket(rsp, nil, nil); err == nil {
-		// now, allow access from receiver
 		c.enableSession()
 	}
-
 	return err
 }
 
@@ -1194,6 +1214,7 @@ func (c *conn) deriveSessionKeys(s *session, sessionKey []byte, preauthHash [64]
 		s.signer = hmac.New(sha256.New, sessionKey)
 		s.verifier = hmac.New(sha256.New, sessionKey)
 	case SMB300, SMB302:
+		s.cipherId = AES128CCM
 		signingKey := kdf(sessionKey, []byte("SMB2AESCMAC\x00"), []byte("SmbSign\x00"))
 		ciph, err := aes.NewCipher(signingKey)
 		if err != nil {
@@ -1202,8 +1223,9 @@ func (c *conn) deriveSessionKeys(s *session, sessionKey []byte, preauthHash [64]
 		s.signer = cmac.New(ciph)
 		s.verifier = cmac.New(ciph)
 
-		encryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerIn \x00"))
-		decryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerOut\x00"))
+		// SMB3.0/3.0.2: server encrypts with ServerOut and decrypts with ServerIn.
+		encryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerOut\x00"))
+		decryptionKey := kdf(sessionKey, []byte("SMB2AESCCM\x00"), []byte("ServerIn \x00"))
 
 		ciph, err = aes.NewCipher(encryptionKey)
 		if err != nil {
@@ -1224,6 +1246,7 @@ func (c *conn) deriveSessionKeys(s *session, sessionKey []byte, preauthHash [64]
 		}
 	case SMB311:
 		s.preauthIntegrityHashValue = preauthHash
+		s.cipherId = c.cipherId
 		signingKey := kdf(sessionKey, []byte("SMBSigningKey\x00"), s.preauthIntegrityHashValue[:])
 		ciph, err := aes.NewCipher(signingKey)
 		if err != nil {
@@ -1232,8 +1255,9 @@ func (c *conn) deriveSessionKeys(s *session, sessionKey []byte, preauthHash [64]
 		s.signer = cmac.New(ciph)
 		s.verifier = cmac.New(ciph)
 
-		encryptionKey := kdf(sessionKey, []byte("SMBC2CCipherKey\x00"), s.preauthIntegrityHashValue[:])
-		decryptionKey := kdf(sessionKey, []byte("SMBS2SCipherKey\x00"), s.preauthIntegrityHashValue[:])
+		// SMB3.1.1: server encrypts with S2C key and decrypts with C2S key.
+		encryptionKey := kdf(sessionKey, []byte("SMBS2CCipherKey\x00"), s.preauthIntegrityHashValue[:])
+		decryptionKey := kdf(sessionKey, []byte("SMBC2SCipherKey\x00"), s.preauthIntegrityHashValue[:])
 
 		switch c.cipherId {
 		case AES128CCM:
@@ -1390,6 +1414,9 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 	flags := uint16(0)
 	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
 		flags = SMB2_SESSION_FLAG_IS_GUEST
+	} else if c.shouldEncryptSession() {
+		flags |= SMB2_SESSION_FLAG_ENCRYPT_DATA
+		c.infof("session binding security: encryption=enabled cipher=%s", cipherName(c.cipherId))
 	}
 
 	s := &session{
@@ -1399,19 +1426,6 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 		sessionId:      ps.sessionId,
 		username:       user,
 	}
-
-	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
-		sessionKey := ps.spnego.sessionKey()
-		if err := c.deriveSessionKeys(s, sessionKey, ps.preauthHash); err != nil {
-			c.pendingSetup = nil
-			return err
-		}
-	}
-
-	c.pendingSetup = nil
-
-	// Add the new session to the connection's session map.
-	c.setSession(s)
 
 	rsp := &SessionSetupResponse{
 		SessionFlags:   s.sessionFlags,
@@ -1424,7 +1438,19 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 	rsp.SessionId = s.sessionId
 	rsp.SecurityBuffer = outputToken
 
-	return c.sendPacket(rsp, nil, nil)
+	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
+		sessionKey := ps.spnego.sessionKey()
+		if err := c.deriveSessionKeys(s, sessionKey, ps.preauthHash); err != nil {
+			c.pendingSetup = nil
+			return err
+		}
+	}
+
+	// Add the new session to the connection's session map.
+	c.setSession(s)
+	err = c.sendPacket(rsp, nil, nil)
+	c.pendingSetup = nil
+	return err
 }
 
 func (d *Server) addOpen(open *Open) {

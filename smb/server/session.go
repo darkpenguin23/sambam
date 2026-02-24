@@ -17,6 +17,7 @@ type session struct {
 	sessionFlags              uint16
 	sessionId                 uint64
 	username                  string
+	cipherId                  uint16
 	preauthIntegrityHashValue [64]byte
 
 	signer    hash.Hash
@@ -78,7 +79,11 @@ func (s *session) encrypt(pkt []byte) ([]byte, error) {
 	t.SetProtocolId()
 	t.SetNonce(nonce)
 	t.SetOriginalMessageSize(uint32(len(pkt)))
-	t.SetFlags(Encrypted)
+	if s.conn != nil && s.conn.dialect == SMB311 {
+		t.SetFlags(Encrypted)
+	} else {
+		t.SetEncryptionAlgorithm(s.cipherId)
+	}
 	t.SetSessionId(s.sessionId)
 
 	s.encrypter.Seal(c[:52], nonce, pkt, t.AssociatedData())
