@@ -35,7 +35,7 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[user.<name>]` config
 - **Multiple shares** - Share multiple directories with different names
 - **Per-share access control** - `allow_users` and share-level `readonly` in config
-- **SMB3 encryption by default** - Automatically used when the client supports it
+- **SMB3 encryption by default** - Automatically used for authenticated user sessions when the client supports it
 - **Auto-expire** - Automatically stop sharing after a set time
 - **Config file** - Layered defaults, or explicit `-c` config-only mode
 - **Cross-platform clients** - Works with Windows 10/11, macOS, and Linux (CIFS mount)
@@ -366,6 +366,7 @@ Notes:
 - `allow_users = ["alice", "bob"]` restricts a share to specific authenticated users.
 - `allow_users = ["guest", "alice"]` allows both guest and selected users.
 - `smb3_encryption` is enabled by default. Set `smb3_encryption = false` only for compatibility troubleshooting.
+- Guest sessions (`allow_users = ["guest"]`) are not encrypted; use authenticated users if you require SMB encryption.
 
 See `sambamrc.example` for a full example.
 

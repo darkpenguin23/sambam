@@ -1055,6 +1055,22 @@ func (c *conn) shouldEncryptSession() bool {
 	return c.capabilities&SMB2_GLOBAL_CAP_ENCRYPTION != 0
 }
 
+func (c *conn) encryptionDisabledReason() string {
+	if c.serverCtx == nil {
+		return "server context unavailable"
+	}
+	if !c.serverCtx.enableSMB3Encryption {
+		return "disabled by server config"
+	}
+	if c.dialect < SMB300 {
+		return fmt.Sprintf("dialect=%s", dialectName(c.dialect))
+	}
+	if c.capabilities&SMB2_GLOBAL_CAP_ENCRYPTION == 0 {
+		return "client capability not advertised"
+	}
+	return "not negotiated"
+}
+
 func (c *conn) calcPreauthHash(pkt []byte) {
 	switch c.dialect {
 	case SMB311:
@@ -1161,11 +1177,11 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 	c.logClientProfile()
 	c.infof("authenticated: %s", user)
 	flags := uint16(0)
-	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
-		flags = SMB2_SESSION_FLAG_IS_GUEST
+	isGuest := strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user))
+	if isGuest {
+		flags |= SMB2_SESSION_FLAG_IS_GUEST
 	} else if c.shouldEncryptSession() {
 		flags |= SMB2_SESSION_FLAG_ENCRYPT_DATA
-		c.infof("session security: encryption=enabled cipher=%s", cipherName(c.cipherId))
 	}
 
 	sessionId := p.SessionId()
@@ -1194,6 +1210,13 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 		if err := c.deriveSessionKeys(s, sessionKey, c.preauthIntegrityHashValue); err != nil {
 			return err
 		}
+	}
+	if s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 {
+		c.infof("session security: encryption=enabled cipher=%s", cipherName(c.cipherId))
+	} else if isGuest {
+		c.infof("session security: encryption=disabled reason=guest session")
+	} else {
+		c.infof("session security: encryption=disabled reason=%s", c.encryptionDisabledReason())
 	}
 
 	// Set session before sending final SESSION_SETUP so response can be signed.
@@ -1412,11 +1435,11 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 	c.infof("session binding authenticated: %s (sid=%d)", user, ps.sessionId)
 
 	flags := uint16(0)
-	if strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user)) {
-		flags = SMB2_SESSION_FLAG_IS_GUEST
+	isGuest := strings.EqualFold(user, "guest") || user == "" || (c.serverCtx.allowGuest && !c.serverCtx.isConfiguredUser(user))
+	if isGuest {
+		flags |= SMB2_SESSION_FLAG_IS_GUEST
 	} else if c.shouldEncryptSession() {
 		flags |= SMB2_SESSION_FLAG_ENCRYPT_DATA
-		c.infof("session binding security: encryption=enabled cipher=%s", cipherName(c.cipherId))
 	}
 
 	s := &session{
@@ -1444,6 +1467,13 @@ func (c *conn) sessionSetupCompleteBinding(pkt []byte) error {
 			c.pendingSetup = nil
 			return err
 		}
+	}
+	if s.sessionFlags&SMB2_SESSION_FLAG_ENCRYPT_DATA != 0 {
+		c.infof("session binding security: encryption=enabled cipher=%s", cipherName(c.cipherId))
+	} else if isGuest {
+		c.infof("session binding security: encryption=disabled reason=guest session")
+	} else {
+		c.infof("session binding security: encryption=disabled reason=%s", c.encryptionDisabledReason())
 	}
 
 	// Add the new session to the connection's session map.
