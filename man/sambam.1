@@ -8,6 +8,9 @@ sambam \- instant SMB/CIFS file sharing
 .br
 .B sambam
 .B stop
+.br
+.B sambam
+.B status
 .SH DESCRIPTION
 .B sambam
 starts a lightweight SMB server to share local directories with Windows, macOS, and Linux clients.
@@ -28,6 +31,53 @@ When
 is used, default discovery is disabled and only explicit config files are loaded in the order passed.
 .PP
 Command-line flags override all config file values.
+.PP
+On startup, sambam reports loaded config files in concise form, for example:
+.IP
+.I config: loaded /etc/sambamrc, /root/.sambamrc, .sambamrc
+.PP
+or:
+.IP
+.I config: loaded none
+.PP
+Global config keys under
+.B [global]
+include:
+.IP "\(bu" 4
+.B allow
+(default:
+.I ["0.0.0.0/0"]
+, allow all clients)
+.IP "\(bu" 4
+.B smb3_encryption
+(default:
+.I true
+, used when client supports SMB3 encryption)
+.IP "\(bu" 4
+.B guest_browse_ipc
+(default:
+.I true
+, allows guest IPC$/browse for discovery while share ACLs are still enforced)
+.IP "\(bu" 4
+.B show_connect_hints
+(default:
+.I true
+, shows Windows/macOS/Linux connect commands in startup banner)
+.IP "\(bu" 4
+.B discovery_name_mdns
+(default:
+.I "<hostname>-sambam"
+)
+.IP "\(bu" 4
+.B discovery_name_wsd
+(default:
+.I "<hostname>"
+)
+.IP "\(bu" 4
+.B advertise
+(default:
+.I true
+)
 .SH OPTIONS
 .TP
 .BR "-n, --name" " <name|name:path>"
@@ -37,7 +87,10 @@ Share name or name:path pair. Repeatable.
 Listen address (default: 0.0.0.0:445). Supports IP:port or @interface[:port]. Repeatable.
 .TP
 .BR "-a, --allow" " <ip-or-cidr>"
-Allow client IP/CIDR. Repeatable.
+Allow client IP/CIDR. Repeatable. Default allows all clients.
+.TP
+.BR "-x, --no-advertise"
+Disable share advertisement (mDNS/WSD).
 .TP
 .BR "-r, --readonly"
 Make share read-only.
@@ -99,6 +152,8 @@ Run as daemon:
 .B sambam -d /data
 .br
 .B sambam stop
+.br
+.B sambam status
 .SH FILES
 .TP
 .I /etc/sambamrc

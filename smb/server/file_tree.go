@@ -1155,11 +1155,23 @@ func (t *fileTree) ioctl(ctx *compoundContext, pkt []byte) error {
 
 	c := t.session.conn
 
-	res, _ := accept(SMB2_IOCTL, pkt)
+	res, err := accept(SMB2_IOCTL, pkt)
+	if err != nil {
+		return err
+	}
 	r := IoctlRequestDecoder(res)
+	if r.IsInvalid() {
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INVALID_PARAMETER))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+	fileID := uint64(0)
+	if fid := r.FileId(); fid != nil {
+		fileID = fid.Decode().HandleId()
+	}
 	log.Tracef("ioctl req: code=0x%x fileId=%d inLen=%d outLen=%d maxOut=%d flags=0x%x",
 		r.CtlCode(),
-		r.FileId().Decode().HandleId(),
+		fileID,
 		r.InputCount(),
 		r.OutputCount(),
 		r.MaxOutputResponse(),

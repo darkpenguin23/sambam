@@ -29,19 +29,19 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 
 ## Features
 
-- **Zero configuration** - No config files, no setup wizards, no existential dread
-- **Anonymous access** - No passwords by default (or add authentication if needed)
-- **Optional authentication** - Require username/password when you need it
-- **Tiered auth model** - Single-user CLI, multi-user CLI shorthand, or `[user.<name>]` config
-- **Multiple shares** - Share multiple directories with different names
-- **Per-share access control** - `allow_users` and share-level `readonly` in config
-- **SMB3 encryption by default** - Automatically used for authenticated user sessions when the client supports it
-- **Auto-expire** - Automatically stop sharing after a set time
-- **Config file** - Layered defaults, or explicit `-c` config-only mode
-- **Cross-platform clients** - Works with Windows 10/11, macOS, and Linux (CIFS mount)
-- **SMB 2.1 / 3.0 / 3.1.1** - Compatible with modern SMB protocol versions, including POSIX extensions
-- **Single binary** - Runs on any Linux distribution (Debian, Ubuntu, OpenWrt, etc.)
-- **Daemon mode** - Run in background, stop when done
+- **Zero setup** - One command starts sharing, no service install required
+- **Config is optional** - Run CLI-only, use layered defaults (`/etc`, home, local), or use explicit `-c` config-only mode
+- **Anonymous by default** - Guest access works out of the box
+- **Optional authentication** - Add users/passwords via CLI or config
+- **Multiple shares** - Share multiple directories with custom names
+- **Per-share ACLs** - `allow_users` and share-level `readonly`
+- **SMB3 encryption by default** - Enabled automatically for authenticated sessions when client supports it
+- **Discovery support** - mDNS (macOS) and WSD (Windows), with `--no-advertise` to disable
+- **Auto-expire** - Stop sharing automatically after a duration
+- **Daemon mode** - Run in background with `sambam status` / `sambam stop`
+- **Cross-platform clients** - Windows 10/11, macOS, Linux (CIFS mount)
+- **SMB 2.1 / 3.0 / 3.1.1** - Modern protocol support, including POSIX extensions
+- **Single binary** - Runs on Linux distributions (Debian, Ubuntu, OpenWrt, etc.)
 - **Shell completions** - Bash and Fish completion scripts included
 
 ## Installation
@@ -296,12 +296,13 @@ CLI flags override all config values.
 listen = "0.0.0.0:445"
 # listen = ["@eth0:445", "10.23.22.13:445"]
 
-allow = ["10.23.0.0/16"]
+allow = ["0.0.0.0/0"]
 advertise = true
 smb3_encryption = true
 guest_browse_ipc = true
-discovery_name_mdns = "sambam-dev-sambam"
-discovery_name_wsd = "sambam-dev"
+show_connect_hints = true
+discovery_name_mdns = "<hostname>-sambam"
+discovery_name_wsd = "<hostname>"
 readonly = false
 hide_dotfiles = false
 
@@ -341,10 +342,11 @@ readonly = false
 
 Global options:
 - `listen` (string or array)
-- `allow`
+- `allow` (default: allow all, e.g. `["0.0.0.0/0"]`)
 - `advertise` (default: `true`)
 - `smb3_encryption` (default: `true`; used when client supports SMB3 encryption)
 - `guest_browse_ipc` (default: `true`; allows guest auth for IPC$/browse discovery even when shares require users)
+- `show_connect_hints` (default: `true`; show Windows/macOS/Linux connect commands in startup banner)
 - `discovery_name_mdns` (default: `<hostname>-sambam`)
 - `discovery_name_wsd` (default: `<hostname>`)
 - `hide_dotfiles`
@@ -384,39 +386,43 @@ sambam -v
 You will see a line like:
 
 ```text
-config: system=true (/etc/sambamrc), home=true (/root/.sambamrc), local=true (.sambamrc), custom=0
+config: loaded /etc/sambamrc, /root/.sambamrc, .sambamrc
 ```
 
 ## Connecting from Windows
 
-Once sambam is running, it shows you the exact path to use:
+Once sambam is running, it prints ready-to-use connection paths:
 
 ```
-  sambam v1.2.6
+  sambam v1.4.x
 
   Sharing      /home/user/documents
-  Share        share
-  Listen       0.0.0.0:445
+  Share        documents
+  Listen       10.23.22.13:445
   Mode         read-write
   Auth         anonymous
 
-  Connect from Windows:
-    \\192.168.1.100\share
-
-  Built with AI assistance
+  All connections:
+  Windows      \\10.23.22.13\documents
+  macOS        smb://10.23.22.13/documents
+  Linux        sudo mount -t cifs //10.23.22.13/documents /mnt -o guest
+               sudo mount -t cifs //10.23.22.13/documents /mnt -o guest,vers=3.1.1,posix,cifsacl # POSIX
 
   Press Ctrl+C to stop
 ```
 
 From Windows:
 1. Open **File Explorer**
-2. Type the path in the address bar: `\\192.168.1.100\share`
+2. Type the path in the address bar: `\\10.23.22.13\documents`
 3. Press Enter
 4. If authentication is required, enter the username and password
 
 Or mount as a drive:
 ```cmd
-net use Z: \\192.168.1.100\share /user:admin
+net use Z: \\10.23.22.13\documents
+
+# With authentication
+net use Z: \\10.23.22.13\documents /user:alice
 ```
 
 ## Connecting from Linux

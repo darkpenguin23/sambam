@@ -19,6 +19,9 @@ smb3_encryption = true
 # while share ACLs still enforce access.
 # Set to false to disable guest browse fallback.
 guest_browse_ipc = true
+# Show connection helper commands in startup banner.
+# Set to false for a quieter banner.
+show_connect_hints = true
 # Friendly discovery names shown to clients.
 # mDNS (macOS Finder) default when omitted: "<hostname>-sambam"
 # WSD (Windows Network) default when omitted: "<hostname>"
