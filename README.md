@@ -299,6 +299,7 @@ listen = "0.0.0.0:445"
 allow = ["10.23.0.0/16"]
 advertise = true
 smb3_encryption = true
+guest_browse_ipc = true
 discovery_name_mdns = "sambam-dev-sambam"
 discovery_name_wsd = "sambam-dev"
 readonly = false
@@ -343,6 +344,7 @@ Global options:
 - `allow`
 - `advertise` (default: `true`)
 - `smb3_encryption` (default: `true`; used when client supports SMB3 encryption)
+- `guest_browse_ipc` (default: `true`; allows guest auth for IPC$/browse discovery even when shares require users)
 - `discovery_name_mdns` (default: `<hostname>-sambam`)
 - `discovery_name_wsd` (default: `<hostname>`)
 - `hide_dotfiles`
@@ -367,6 +369,7 @@ Notes:
 - `allow_users = ["guest", "alice"]` allows both guest and selected users.
 - `smb3_encryption` is enabled by default. Set `smb3_encryption = false` only for compatibility troubleshooting.
 - Guest sessions (`allow_users = ["guest"]`) are not encrypted; use authenticated users if you require SMB encryption.
+- `guest_browse_ipc = true` improves Finder "click discovered server" behavior on macOS while still enforcing share ACLs. Set it to `false` to require authenticated session setup from the start.
 
 See `sambamrc.example` for a full example.
 

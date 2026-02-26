@@ -15,6 +15,10 @@ advertise = true
 # SMB3 encryption is enabled by default (when client supports it).
 # Set to false only for compatibility troubleshooting.
 smb3_encryption = true
+# Allow guest session setup for IPC$/browse discovery (macOS Finder compatibility),
+# while share ACLs still enforce access.
+# Set to false to disable guest browse fallback.
+guest_browse_ipc = true
 # Friendly discovery names shown to clients.
 # mDNS (macOS Finder) default when omitted: "<hostname>-sambam"
 # WSD (Windows Network) default when omitted: "<hostname>"

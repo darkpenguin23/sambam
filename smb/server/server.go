@@ -277,9 +277,6 @@ func (d *Server) isShareAllowed(shareName, username string) bool {
 }
 
 func (d *Server) isShareGuest(shareName string) bool {
-	if d.allowGuest && len(d.shareGuest) == 0 {
-		return true
-	}
 	return d.shareGuest[strings.ToUpper(shareName)]
 }
 

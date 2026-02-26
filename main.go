@@ -71,6 +71,7 @@ type Config struct {
 	Listen            string
 	ListenAddrs       []string
 	SMB3Encryption    bool
+	GuestBrowseIPC    bool
 	Advertise         bool
 	DiscoveryNameMDNS string
 	DiscoveryNameWSD  string
@@ -164,7 +165,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 	}
 
 	legacyRoots := []string{
-		"listen", "listen_addrs", "allow", "smb3_encryption", "advertise", "discovery_name_mdns", "discovery_name_wsd", "readonly",
+		"listen", "listen_addrs", "allow", "smb3_encryption", "guest_browse_ipc", "advertise", "discovery_name_mdns", "discovery_name_wsd", "readonly",
 		"verbose", "verbose_level", "debug", "trace", "hide_dotfiles",
 		"expire", "pidfile", "logfile", "users", "shares", "username", "password",
 	}
@@ -222,6 +223,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 		}
 		type globalConfig struct {
 			SMB3Encryption    bool   `toml:"smb3_encryption"`
+			GuestBrowseIPC    bool   `toml:"guest_browse_ipc"`
 			Advertise         bool   `toml:"advertise"`
 			DiscoveryNameMDNS string `toml:"discovery_name_mdns"`
 			DiscoveryNameWSD  string `toml:"discovery_name_wsd"`
@@ -240,6 +242,7 @@ func decodeConfigFile(path string) (*Config, toml.MetaData, error) {
 			return nil, md, fmt.Errorf("invalid [global] section")
 		}
 		cfg.SMB3Encryption = gcfg.SMB3Encryption
+		cfg.GuestBrowseIPC = gcfg.GuestBrowseIPC
 		cfg.Advertise = gcfg.Advertise
 		cfg.DiscoveryNameMDNS = gcfg.DiscoveryNameMDNS
 		cfg.DiscoveryNameWSD = gcfg.DiscoveryNameWSD
@@ -348,6 +351,9 @@ func applyConfigOverrides(dst *Config, src *Config, md toml.MetaData) {
 	}
 	if md.IsDefined("global", "smb3_encryption") {
 		dst.SMB3Encryption = src.SMB3Encryption
+	}
+	if md.IsDefined("global", "guest_browse_ipc") {
+		dst.GuestBrowseIPC = src.GuestBrowseIPC
 	}
 	if md.IsDefined("global", "advertise") {
 		dst.Advertise = src.Advertise
@@ -463,6 +469,9 @@ func recordConfigSources(info *ConfigLoadInfo, md toml.MetaData, src string, cfg
 	if md.IsDefined("global", "smb3_encryption") {
 		record("smb3_encryption")
 	}
+	if md.IsDefined("global", "guest_browse_ipc") {
+		record("guest_browse_ipc")
+	}
 	if md.IsDefined("global", "advertise") {
 		record("advertise")
 	}
@@ -540,6 +549,8 @@ func configValueString(cfg *Config, key string) string {
 		return cfg.Listen
 	case "smb3_encryption":
 		return strconv.FormatBool(cfg.SMB3Encryption)
+	case "guest_browse_ipc":
+		return strconv.FormatBool(cfg.GuestBrowseIPC)
 	case "advertise":
 		return strconv.FormatBool(cfg.Advertise)
 	case "discovery_name_mdns":
@@ -745,7 +756,7 @@ func generatePassword(length int) string {
 }
 
 var (
-	version = "1.4.37"
+	version = "1.4.38"
 )
 
 func main() {
@@ -849,6 +860,12 @@ func main() {
 			enableSMB3Encryption = config.SMB3Encryption
 		}
 	}
+	guestBrowseIPC := true
+	if config != nil {
+		if _, ok := configInfo.SettingSrc["guest_browse_ipc"]; ok {
+			guestBrowseIPC = config.GuestBrowseIPC
+		}
+	}
 	// Backward-compatible environment override.
 	if v := strings.TrimSpace(os.Getenv("SAMBAM_ENABLE_SMB3_ENCRYPTION")); v != "" {
 		enableSMB3Encryption = normalize_bool_env(v)
@@ -896,6 +913,7 @@ func main() {
 	}
 	effectiveConfig.Readonly = *readOnly
 	effectiveConfig.Advertise = advertiseEnabled
+	effectiveConfig.GuestBrowseIPC = guestBrowseIPC
 	effectiveConfig.HideDotfiles = *hideDotfiles
 	if len(authUsers) > 1 {
 		effectiveConfig.Users = authUsersToConfig(authUsers)
@@ -1057,22 +1075,23 @@ func main() {
 			return
 		}
 		configLogsPrinted = true
-		if configInfo.SystemLoaded || configInfo.HomeLoaded || configInfo.LocalLoaded || len(configInfo.CustomLoaded) > 0 {
-			logrus.Infof(
-				"config: system=%t (%s), home=%t (%s), local=%t (%s), custom=%d",
-				configInfo.SystemLoaded, configInfo.SystemPath,
-				configInfo.HomeLoaded, configInfo.HomePath,
-				configInfo.LocalLoaded, configInfo.LocalPath,
-				len(configInfo.CustomLoaded),
-			)
-			if len(configInfo.CustomLoaded) > 0 {
-				logrus.Infof("config custom: %s", strings.Join(configInfo.CustomLoaded, ", "))
-			}
+		loaded := make([]string, 0, 3+len(configInfo.CustomLoaded))
+		if configInfo.SystemLoaded {
+			loaded = append(loaded, configInfo.SystemPath)
+		}
+		if configInfo.HomeLoaded {
+			loaded = append(loaded, configInfo.HomePath)
+		}
+		if configInfo.LocalLoaded {
+			loaded = append(loaded, configInfo.LocalPath)
+		}
+		if len(configInfo.CustomLoaded) > 0 {
+			loaded = append(loaded, configInfo.CustomLoaded...)
+		}
+		if len(loaded) == 0 {
+			logrus.Infof("config: loaded none")
 		} else {
-			logrus.Infof(
-				"config: no config file loaded (checked %s, %s, %s, custom=%d)",
-				configInfo.SystemPath, configInfo.HomePath, configInfo.LocalPath, len(configInfo.CustomPaths),
-			)
+			logrus.Infof("config: loaded %s", strings.Join(loaded, ", "))
 		}
 		if *verbose >= 2 && len(effectiveSrc) > 0 {
 			keys := make([]string, 0, len(effectiveSrc))
@@ -1470,7 +1489,7 @@ func main() {
 	shareGuest := map[string]bool{}
 	guestShareExists := false
 	for _, share := range shares {
-		if share.Guest {
+		if len(authUsers) == 0 || share.Guest {
 			shareGuest[share.Name] = true
 			guestShareExists = true
 		}
@@ -1479,6 +1498,11 @@ func main() {
 		}
 	}
 	if guestShareExists {
+		allowGuest = true
+	}
+	if guestBrowseIPC && len(authUsers) > 0 {
+		// Finder browse flow commonly probes IPC$ with guest first.
+		// Keep guest auth available for discovery while share ACLs still gate data shares.
 		allowGuest = true
 	}
 
@@ -2098,6 +2122,7 @@ type listenEndpoint struct {
 	Bind     string
 	Display  string
 	IP       string
+	Interface string
 	Port     string
 	Wildcard bool
 }
@@ -2163,11 +2188,12 @@ func buildListenEndpoints(values []string) ([]listenEndpoint, string, error) {
 			display = fmt.Sprintf("%s %s", bind, Dim(fmt.Sprintf("(from @%s)", iface)))
 		}
 		endpoints = append(endpoints, listenEndpoint{
-			Bind:     bind,
-			Display:  display,
-			IP:       resolvedHost,
-			Port:     port,
-			Wildcard: wildcard,
+			Bind:      bind,
+			Display:   display,
+			IP:        resolvedHost,
+			Interface: iface,
+			Port:      port,
+			Wildcard:  wildcard,
 		})
 	}
 
@@ -2287,6 +2313,63 @@ func advertiseIPsFromEndpoints(endpoints []listenEndpoint) []string {
 	return out
 }
 
+func interfaceNameForIP(ip string) string {
+	target := net.ParseIP(strings.TrimSpace(ip))
+	if target == nil {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			var ipNet *net.IPNet
+			switch v := a.(type) {
+			case *net.IPNet:
+				ipNet = v
+			case *net.IPAddr:
+				ipNet = &net.IPNet{IP: v.IP}
+			}
+			if ipNet == nil {
+				continue
+			}
+			if ipNet.IP.Equal(target) {
+				return iface.Name
+			}
+		}
+	}
+	return ""
+}
+
+func wsdBindFromEndpoints(endpoints []listenEndpoint) (bindIP string, ifaceName string) {
+	if len(endpoints) == 0 {
+		return "0.0.0.0", ""
+	}
+	for _, ep := range endpoints {
+		if ep.Wildcard {
+			return "0.0.0.0", ""
+		}
+	}
+	// Single specific endpoint: bind WSD to the same IP/interface as SMB.
+	if len(endpoints) == 1 {
+		ep := endpoints[0]
+		iface := strings.TrimSpace(ep.Interface)
+		if iface == "" {
+			iface = interfaceNameForIP(ep.IP)
+		}
+		if ep.IP != "" {
+			return ep.IP, iface
+		}
+	}
+	// Multiple specific endpoints cannot be represented by a single bind target.
+	return "0.0.0.0", ""
+}
+
 func stableUUIDFromSeed(seed string) string {
 	sum := sha1.Sum([]byte(seed))
 	b := sum[:16]
@@ -2340,6 +2423,10 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint, wsdName string
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no usable IP addresses for WSD")
 	}
+	wsdBindIP, wsdIfaceName := wsdBindFromEndpoints(endpoints)
+	if wsdBindIP != "" && wsdBindIP != "0.0.0.0" {
+		ips = []string{wsdBindIP}
+	}
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "sambam"
@@ -2364,7 +2451,16 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint, wsdName string
 	uuid := stableUUIDFromSeed(seed)
 
 	mcast := &net.UDPAddr{IP: net.ParseIP("239.255.255.250"), Port: 3702}
-	conn, err := net.ListenMulticastUDP("udp4", nil, mcast)
+	var ifi *net.Interface
+	if strings.TrimSpace(wsdIfaceName) != "" {
+		var ifaceErr error
+		ifi, ifaceErr = net.InterfaceByName(wsdIfaceName)
+		if ifaceErr != nil {
+			logrus.Warnf("wsd multicast: interface %q unavailable, using all interfaces: %v", wsdIfaceName, ifaceErr)
+			ifi = nil
+		}
+	}
+	conn, err := net.ListenMulticastUDP("udp4", ifi, mcast)
 	if err != nil {
 		return nil, err
 	}
@@ -2389,7 +2485,7 @@ func startWSDiscovery(shares []Share, endpoints []listenEndpoint, wsdName string
 		wsd.xaddrs = append(wsd.xaddrs, fmt.Sprintf("http://%s:5357/%s", ip, wsd.endpointUUID))
 	}
 	wsd.xaddr = wsd.xaddrs[0]
-	if err := wsd.startMetadataHTTP("0.0.0.0"); err != nil {
+	if err := wsd.startMetadataHTTP(wsdBindIP); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
