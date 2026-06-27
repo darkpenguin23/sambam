@@ -30,6 +30,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
+	"github.com/sambam/sambam/smb/osfs"
 	smb2 "github.com/sambam/sambam/smb/server"
 	"github.com/sambam/sambam/smb/vfs"
 )
@@ -1409,7 +1410,7 @@ func main() {
 	// Create filesystems for all shares
 	vfsShares := make(map[string]vfs.VFSFileSystem)
 	for _, share := range shares {
-		fs := NewPassthroughFS(share.Path, share.ReadOnly)
+		fs := osfs.NewPassthroughFS(share.Path, share.ReadOnly)
 
 		// Note: create/replace/delete logs are emitted in SMB handlers so they carry client context.
 		if extraVerbose {

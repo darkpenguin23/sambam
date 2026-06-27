@@ -1,4 +1,4 @@
-package main
+package osfs
 
 import (
 	"crypto/rand"
