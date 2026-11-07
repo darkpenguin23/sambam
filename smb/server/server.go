@@ -95,6 +95,8 @@ type notifyEvent struct {
 
 type Open struct {
 	ioMu                        sync.Mutex
+	enumStarted                 bool // QUERY_DIRECTORY: a query already ran in the current scan
+	enumSingleDone              bool // QUERY_DIRECTORY: entry for a non-wildcard name already returned
 	fileId                      uint64
 	durableFileId               uint64
 	session                     *session

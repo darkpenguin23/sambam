@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 
 	"github.com/sambam/sambam/smb/vfs"
@@ -31,16 +31,94 @@ func UTF16ToString(s []uint16) string {
 	return string(utf16.Decode(s))
 }
 
-func wildcardToRegexp(pattern string) string {
-	return "^" + strings.ReplaceAll(strings.ReplaceAll(pattern, "?", "."), "*", ".*") + "$"
+// MatchWildcard reports whether the file name s matches an SMB search
+// pattern, following MS-FSA 2.1.4.4 (FsRtlIsNameInExpression):
+//
+//   - '*' matches any sequence of characters (including none)
+//   - '?' matches exactly one character
+//   - '<' (DOS_STAR) matches any sequence not extending past the last '.'
+//     in the name
+//   - '>' (DOS_QM) matches any single character except '.', and nothing at
+//     a '.' or at the end of the name
+//   - '"' (DOS_DOT) matches a '.', or nothing at the end of the name
+//
+// All other characters match literally and case-insensitively, like
+// Windows. Windows clients send the DOS forms (e.g. `dir *.txt` arrives as
+// `<.txt`). The match runs in O(len(pattern)*len(name)) time, so hostile
+// patterns such as "*a*a*a*b" cannot cause exponential backtracking.
+func MatchWildcard(s, pattern string) bool {
+	name := []rune(s)
+	pat := []rune(pattern)
+	lastDot := -1
+	for i, r := range name {
+		if r == '.' {
+			lastDot = i
+		}
+	}
+
+	// reach[j] reports whether name[:j] can be matched by the pattern prefix
+	// processed so far.
+	reach := make([]bool, len(name)+1)
+	next := make([]bool, len(name)+1)
+	reach[0] = true
+	for _, pc := range pat {
+		for j := range next {
+			next[j] = false
+		}
+		switch pc {
+		case '*':
+			for j := 0; j <= len(name); j++ {
+				next[j] = reach[j] || (j > 0 && next[j-1])
+			}
+		case '<':
+			for j := 0; j <= len(name); j++ {
+				// May consume name[j-1] only if it lies before the last dot
+				// (or the name has no dot at all).
+				canConsume := j > 0 && (lastDot < 0 || j-1 < lastDot)
+				next[j] = reach[j] || (canConsume && next[j-1])
+			}
+		case '>':
+			for j := 0; j <= len(name); j++ {
+				if !reach[j] {
+					continue
+				}
+				if j < len(name) && name[j] != '.' {
+					next[j+1] = true
+				} else {
+					next[j] = true // zero-width at '.' or end of name
+				}
+			}
+		case '"':
+			for j := 0; j <= len(name); j++ {
+				if !reach[j] {
+					continue
+				}
+				if j == len(name) {
+					next[j] = true
+				} else if name[j] == '.' {
+					next[j+1] = true
+				}
+			}
+		case '?':
+			for j := 0; j < len(name); j++ {
+				if reach[j] {
+					next[j+1] = true
+				}
+			}
+		default:
+			for j := 0; j < len(name); j++ {
+				if reach[j] && foldEqual(name[j], pc) {
+					next[j+1] = true
+				}
+			}
+		}
+		reach, next = next, reach
+	}
+	return reach[len(name)]
 }
 
-func MatchWildcard(s, pattern string) bool {
-	r, err := regexp.Compile(wildcardToRegexp(pattern))
-	if err != nil {
-		return false
-	}
-	return r.MatchString(s)
+func foldEqual(a, b rune) bool {
+	return a == b || unicode.ToUpper(a) == unicode.ToUpper(b)
 }
 
 func Align(n int, a int) int {
@@ -64,8 +142,10 @@ func (f *FileId) SetNodeId(n uint64) {
 	le.PutUint64(f.Persistent[:], n)
 }
 
+// ContainsWildcard reports whether s is a search pattern rather than a
+// plain file name (see MatchWildcard for the wildcard characters).
 func ContainsWildcard(s string) bool {
-	return strings.Contains(s, "*") || strings.Contains(s, "?")
+	return strings.ContainsAny(s, `*?<>"`)
 }
 
 func BirthTimeFromVfs(a *vfs.Attributes) *Filetime {

@@ -1526,7 +1526,8 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 	}
 
 	dirTarget := fmt.Sprintf("handle=%d", fileId.HandleId())
-	if open := t.conn.serverCtx.getOpen(fileId.HandleId()); open != nil && open.pathName != "" {
+	open := t.conn.serverCtx.getOpen(fileId.HandleId())
+	if open != nil && open.pathName != "" {
 		dirTarget = open.pathName
 	}
 
@@ -1536,83 +1537,119 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 		Status = ctx.lastStatus
 	}
 
+	// RESTART_SCANS and REOPEN both start a new scan of the directory.
+	restart := r.Flags()&(RESTART_SCANS|REOPEN) != 0
 	pos := 0
-	if r.Flags()&RESTART_SCANS != 0 {
+	if restart {
 		pos = 1
+		if open != nil {
+			open.enumStarted = false
+			open.enumSingleDone = false
+		}
 	}
 
+	// An empty search pattern means "*" (as on Windows).
 	name := r.FileName()
+	if name == "" {
+		name = "*"
+	}
 	maxOutBytes := int(r.OutputBufferLength())
 	if maxOutBytes == 0 {
 		maxOutBytes = 65536
 	}
 
 	if Status == 0 {
+		// Nothing to return: STATUS_NO_SUCH_FILE on the first query of a
+		// scan, STATUS_NO_MORE_FILES once the scan is under way.
 		Status = uint32(STATUS_NO_SUCH_FILE)
+		if open != nil && open.enumStarted {
+			Status = uint32(STATUS_NO_MORE_FILES)
+		}
 
 		if !ContainsWildcard(name) {
-			if attrs, err := t.fs.Lookup(vfs.VfsHandle(fileId.HandleId()), name); err == nil {
-				log.Tracef("lookup %s success", name)
-				d := vfs.DirInfo{Name: name, Attributes: *attrs}
-				info := t.makeItem(r.FileInfoClass(), d)
-				out.Items = append(out.Items, info)
-				Status = 0
+			// A plain name yields at most one entry per scan; returning it
+			// on every call made clients that loop until NO_MORE_FILES
+			// (e.g. smbclient `ls file`) spin forever.
+			if open == nil || !open.enumSingleDone {
+				if attrs, err := t.fs.Lookup(vfs.VfsHandle(fileId.HandleId()), name); err == nil {
+					log.Tracef("lookup %s success", name)
+					d := vfs.DirInfo{Name: name, Attributes: *attrs}
+					info := t.makeItem(r.FileInfoClass(), d)
+					out.Items = append(out.Items, info)
+					Status = 0
+					if open != nil {
+						open.enumSingleDone = true
+					}
+				}
 			}
 		} else {
-			dir, err := t.fs.ReadDir(vfs.VfsHandle(fileId.HandleId()), pos, 1000)
-			if err == nil {
-				accSize := 0
+			h := vfs.VfsHandle(fileId.HandleId())
+			accSize := 0
+			// Read batch after batch until something matched, the output
+			// buffer is full or the directory is exhausted. Stopping after
+			// one batch without a match ended the listing early in large
+			// directories.
+			for len(out.Items) == 0 {
+				dir, err := t.fs.ReadDir(h, pos, 1000)
+				pos = 0
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					log.Errorf("queryDirectory: err %v", err)
+					Status = uint32(STATUS_ACCESS_DENIED)
+					break
+				}
+
 				var unconsumed []vfs.DirInfo
 				for i, d := range dir {
 					// Hide macOS AppleDouble and .DS_Store files when AAPL extensions are active
 					if t.aaplExtensions && (strings.HasPrefix(d.Name, "._") || d.Name == ".DS_Store") {
 						continue
 					}
-					if MatchWildcard(d.Name, r.FileName()) {
-						info := t.makeItem(r.FileInfoClass(), d)
-						entrySize := info.Size()
+					if !MatchWildcard(d.Name, name) {
+						continue
+					}
+					info := t.makeItem(r.FileInfoClass(), d)
+					entrySize := info.Size()
 
-						// Check if adding this entry would exceed OutputBufferLength
-						if accSize > 0 && accSize+entrySize > maxOutBytes {
-							// Buffer remaining entries for next call
-							unconsumed = dir[i:]
-							break
+					// Check if adding this entry would exceed OutputBufferLength
+					if accSize > 0 && accSize+entrySize > maxOutBytes {
+						// Buffer remaining entries for next call
+						unconsumed = dir[i:]
+						break
+					}
+
+					out.Items = append(out.Items, info)
+					accSize += entrySize
+					Status = 0
+
+					if r.Flags()&RETURN_SINGLE_ENTRY != 0 {
+						if i+1 < len(dir) {
+							unconsumed = dir[i+1:]
 						}
-
-						out.Items = append(out.Items, info)
-						accSize += entrySize
-						Status = 0
-
-						if r.Flags()&RETURN_SINGLE_ENTRY != 0 {
-							if i+1 < len(dir) {
-								unconsumed = dir[i+1:]
-							}
-							break
-						}
+						break
 					}
 				}
 				// Put back unconsumed entries so the next QueryDirectory gets them
 				if len(unconsumed) > 0 {
-					t.fs.PutBackDirEntries(vfs.VfsHandle(fileId.HandleId()), unconsumed)
-				}
-
-				if r.FileInfoClass() == FilePosixInformation && len(out.Items) > 0 {
-					total := 0
-					for i, it := range out.Items {
-						sz := it.Size()
-						total += sz
-						log.Tracef("POSIX readdir entry[%d]: size=%d", i, sz)
-					}
-					log.Tracef("POSIX readdir: entries=%d totalBytes=%d maxOut=%d", len(out.Items), total, maxOutBytes)
-				}
-			} else {
-				if err == io.EOF {
-					Status = uint32(STATUS_NO_MORE_FILES)
-				} else {
-					log.Errorf("queryDirectory: err %v", err)
-					Status = uint32(STATUS_ACCESS_DENIED)
+					t.fs.PutBackDirEntries(h, unconsumed)
+					break
 				}
 			}
+
+			if r.FileInfoClass() == FilePosixInformation && len(out.Items) > 0 {
+				total := 0
+				for i, it := range out.Items {
+					sz := it.Size()
+					total += sz
+					log.Tracef("POSIX readdir entry[%d]: size=%d", i, sz)
+				}
+				log.Tracef("POSIX readdir: entries=%d totalBytes=%d maxOut=%d", len(out.Items), total, maxOutBytes)
+			}
+		}
+		if open != nil {
+			open.enumStarted = true
 		}
 	} else {
 		out = nil
