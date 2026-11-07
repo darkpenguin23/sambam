@@ -67,6 +67,16 @@ type VFSFileSystem interface {
 	//RemoveNotify(VfsHandle) error
 }
 
+// CaseResolver is implemented by filesystems whose names are case-sensitive
+// on disk (Linux) but have to be looked up case-insensitively, as Windows
+// clients expect. ResolveCase returns p with every component that exists
+// under a different spelling replaced by the name stored on disk; components
+// that do not exist are kept as given, so a new file is created with the
+// client's spelling. A path that exists as given is returned unchanged.
+type CaseResolver interface {
+	ResolveCase(p string) string
+}
+
 // ShareMask is a bitmask of operations that are permitted
 type ShareMask uint32
 

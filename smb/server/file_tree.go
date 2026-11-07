@@ -72,6 +72,16 @@ func (t *fileTree) getTree() *treeConn {
 	return &t.treeConn
 }
 
+// resolveCase maps a share-relative name to the spelling on disk, so names
+// are case-insensitive for clients as the server announces (no
+// FILE_CASE_SENSITIVE_SEARCH); see vfs.CaseResolver.
+func (t *fileTree) resolveCase(name string) string {
+	if cr, ok := t.fs.(vfs.CaseResolver); ok {
+		return cr.ResolveCase(name)
+	}
+	return name
+}
+
 func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	log.Tracef("fileTreeCreate")
 
@@ -122,6 +132,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	if isEA {
 		name, eaKey = SplitEA(name)
 	}
+	name = t.resolveCase(name)
 	shareReadOnly := t.isShareReadOnly()
 
 	if r.SmbCreateFlags() != 0 {
@@ -1539,6 +1550,10 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 			// on every call made clients that loop until NO_MORE_FILES
 			// (e.g. smbclient `ls file`) spin forever.
 			if open == nil || !open.enumSingleDone {
+				// Report the entry under its name on disk.
+				if open != nil && name != "." && name != ".." && !strings.ContainsAny(name, `/\`) {
+					name = path.Base(t.resolveCase(path.Join(open.pathName, name)))
+				}
 				if attrs, err := t.fs.Lookup(vfs.VfsHandle(fileId.HandleId()), name); err == nil {
 					log.Tracef("lookup %s success", name)
 					d := vfs.DirInfo{Name: name, Attributes: *attrs}

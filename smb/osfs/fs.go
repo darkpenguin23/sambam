@@ -3,6 +3,7 @@ package osfs
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -696,16 +697,47 @@ func (fs *PassthroughFS) Rename(from vfs.VfsHandle, to string, flags int) error 
 		return err
 	}
 
+	// The directories of the target are looked up ignoring case; the new
+	// name itself keeps the client's spelling (a case-only rename must
+	// change the name on disk).
 	newPath := relName(to)
-	// A target that is the source itself (same name, or a case-only rename
-	// on a case-insensitive filesystem) is not a collision.
-	if st, err := r.Lstat(newPath); err == nil && !sameFile(r, open.path, st) {
+	dir, base := path.Split(newPath)
+	if dir != "" {
+		dir, _ = resolveRel(r, relName(dir))
+		newPath = path.Join(dir, base)
+	} else {
+		dir = "."
+	}
+	target := newPath
+	st, err := r.Lstat(newPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if match, ok := findFold(r, dir, base); ok {
+			target = path.Join(dir, match)
+			st, err = r.Lstat(target)
+		}
+	}
+	// A target that is the source itself (same name, or a case-only
+	// rename) is not a collision.
+	if err == nil && !sameFile(r, open.path, st) {
 		if flags == 0 {
 			return &os.LinkError{Op: "rename", Old: open.path, New: newPath, Err: os.ErrExist}
 		}
 		// Like NTFS, never replace a directory (Linux would replace an empty one).
 		if st.IsDir() {
 			return &os.LinkError{Op: "rename", Old: open.path, New: newPath, Err: syscall.EISDIR}
+		}
+		if target != newPath {
+			// Replacing an existing file spelled differently: replace it
+			// atomically, then give it the requested spelling like NTFS.
+			// Linux would otherwise keep both names.
+			if err := r.Rename(open.path, target); err != nil {
+				return err
+			}
+			open.path = target
+			if r.Rename(target, newPath) == nil {
+				open.path = newPath
+			}
+			return nil
 		}
 	}
 
