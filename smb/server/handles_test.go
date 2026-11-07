@@ -1,6 +1,7 @@
 package smb2
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -217,5 +218,38 @@ func TestCompoundLastMsgId(t *testing.T) {
 	}
 	if got := compoundLastMsgId([]byte{1, 2, 3}); got != 0 {
 		t.Errorf("garbage: %d", got)
+	}
+}
+
+// SET_INFO(EndOfFile) on a stream used to allocate a buffer of the
+// client-chosen size: a huge value exhausted memory, a negative one panicked.
+func TestStreamResizeIsBounded(t *testing.T) {
+	e := newHandleEnv(t)
+	e.touch("f.txt")
+	ctx := newChain()
+	e.ft.create(ctx, e.encode(&CreateRequest{
+		ImpersonationLevel: 2,
+		DesiredAccess:      FILE_READ_DATA | FILE_WRITE_DATA,
+		ShareAccess:        FILE_SHARE_READ | FILE_SHARE_WRITE,
+		CreateDisposition:  FILE_OPEN_IF,
+		Name:               "f.txt:meta",
+	}, false))
+	if ctx.fileId == nil {
+		t.Skipf("cannot create a stream here (no user xattrs?): %v", statusOf(ctx.rsp[0]))
+	}
+	for _, size := range []int64{1 << 40, -1} {
+		eof := make([]byte, 8)
+		binary.LittleEndian.PutUint64(eof, uint64(size))
+		pkt := e.encode(&SetInfoRequest{
+			InfoType:      SMB2_0_INFO_FILE,
+			FileInfoClass: FileEndOfFileInformation,
+			FileId:        &relatedFileId,
+			Input:         fuzzInput(eof),
+		}, true)
+		before := len(ctx.rsp)
+		mustNotPanicServer(t, func() { e.ft.setInfo(ctx, pkt) })
+		if st := statusOf(ctx.rsp[before]); st != STATUS_DISK_FULL {
+			t.Errorf("EndOfFile=%d on a stream: %v, want STATUS_DISK_FULL", size, st)
+		}
 	}
 }

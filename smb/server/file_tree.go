@@ -926,9 +926,8 @@ func (t *fileTree) writeImpl(ctx *compoundContext, pkt []byte, fileId *FileId, o
 
 	if open.isEa {
 		open.ioMu.Lock()
-		log.Tracef("write ea: key %s, val %s", open.eaKey, r.Data())
-		// ignore xattr errors
-		t.fs.Setxattr(vfs.VfsHandle(fileId.HandleId()), open.eaKey, r.Data())
+		log.Tracef("write ea: key %s, off %d, len %d", open.eaKey, r.Offset(), len(r.Data()))
+		err = t.writeStream(vfs.VfsHandle(fileId.HandleId()), open.eaKey, r.Offset(), r.Data())
 		open.ioMu.Unlock()
 		n = len(r.Data())
 	} else {
@@ -940,9 +939,12 @@ func (t *fileTree) writeImpl(ctx *compoundContext, pkt []byte, fileId *FileId, o
 
 	if err != nil {
 		log.Errorf("Write failed: %v", err)
-		status := STATUS_IO_DEVICE_ERROR
+		status := uint32(STATUS_IO_DEVICE_ERROR)
+		if open.isEa {
+			status = streamWriteStatus(err)
+		}
 		rsp := new(ErrorResponse)
-		PrepareAsyncResponse(rsp.Header(), pkt, asyncId, uint32(status))
+		PrepareAsyncResponse(rsp.Header(), pkt, asyncId, status)
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
@@ -1982,6 +1984,13 @@ func (t *fileTree) queryInfoFile(ctx *compoundContext, pkt []byte) error {
 	var info Encoder
 	switch r.FileInfoClass() {
 	case FileAllInformation:
+		endOfFile, allocSize := int64(SizeFromVfs(a)), int64(DiskSizeFromVfs(a))
+		if open.isEa {
+			// On a stream handle the sizes are the stream's, not the file's
+			// (as for FileNetworkOpenInformation below).
+			l, _ := t.fs.Getxattr(vfs.VfsHandle(fileId.HandleId()), open.eaKey, nil)
+			endOfFile, allocSize = int64(l), int64(l)
+		}
 		info = &FileAllInformationInfo{
 			BasicInformation: FileBasicInformationInfo{
 				CreationTime:   *BirthTimeFromVfs(a),
@@ -1991,8 +2000,8 @@ func (t *fileTree) queryInfoFile(ctx *compoundContext, pkt []byte) error {
 				FileAttributes: PermissionsFromVfs(a, open.pathName, t.conn.serverCtx.hideDotfiles),
 			},
 			StandardInformation: FileStandardInformationInfo{
-				EndOfFile:      int64(SizeFromVfs(a)),
-				AllocationSize: int64(DiskSizeFromVfs(a)),
+				EndOfFile:      endOfFile,
+				AllocationSize: allocSize,
 				NumberOfLinks:  a.GetLinkCount(),
 				Directory:      isDir,
 			},
@@ -2319,10 +2328,15 @@ func (t *fileTree) setEndOfFileInfoEa(ctx *compoundContext, fileId *FileId, open
 	r := SetInfoRequestDecoder(res)
 	info := FileEndOfFileInformationDecoder(r.Buffer())
 
-	v := make([]byte, info.EndOfFile())
 	open.ioMu.Lock()
-	t.fs.Setxattr(vfs.VfsHandle(fileId.HandleId()), eaKey, v)
+	err := t.resizeStream(vfs.VfsHandle(fileId.HandleId()), eaKey, info.EndOfFile())
 	open.ioMu.Unlock()
+	if err != nil {
+		log.Errorf("set stream size %d failed: %v", info.EndOfFile(), err)
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, streamWriteStatus(err))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 
 	rsp := new(SetInfoResponse)
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)

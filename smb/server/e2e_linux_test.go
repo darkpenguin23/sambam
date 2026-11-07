@@ -3,6 +3,7 @@
 package smb2_test
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	client "github.com/hirochachacha/go-smb2"
+	"golang.org/x/sys/unix"
 )
 
 // openFilesUnder counts this process's file descriptors that refer to files
@@ -85,5 +87,86 @@ func TestE2EDisconnectReleasesHandles(t *testing.T) {
 			t.Fatalf("server still holds %d files of the share open after the client disconnected", n)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Alternate data streams (stored as xattrs) must keep data written in
+// several chunks, and a stream that does not fit must fail visibly.
+func TestE2EStreamWrites(t *testing.T) {
+	e := startServer(t)
+	probe := filepath.Join(e.share, "probe")
+	if err := os.WriteFile(probe, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(probe, "user.probe", []byte("x"), 0); err != nil {
+		t.Skipf("filesystem of TMPDIR does not support user xattrs: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(e.share, "f.txt"), []byte("main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fs := e.mustMount(t, "alice", "alicepw")
+	// Read a stream the way Windows does: ask for its size, read exactly
+	// that much. (At the end of a stream the server answers READ with
+	// success and 0 bytes - a deliberate Explorer workaround - so clients
+	// that read until STATUS_END_OF_FILE, like go-smb2's ReadFile, loop.)
+	readStream := func(name string) []byte {
+		t.Helper()
+		f, err := fs.Open(name)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		buf := make([]byte, fi.Size())
+		if _, err := f.ReadAt(buf, 0); err != nil && len(buf) > 0 {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		return buf
+	}
+
+	f, err := fs.OpenFile("f.txt:meta", os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	first := bytes.Repeat([]byte("A"), 1000)
+	second := bytes.Repeat([]byte("B"), 2000)
+	if _, err := f.WriteAt(first, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(second, 1000); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	got := readStream("f.txt:meta")
+	if want := append(append([]byte{}, first...), second...); !bytes.Equal(got, want) {
+		t.Fatalf("stream after two chunked writes: %d bytes, want %d (prefix %q)", len(got), len(want), got[:min(len(got), 8)])
+	}
+
+	// Truncating keeps the remaining content.
+	f, err = fs.OpenFile("f.txt:meta", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(1500); err != nil {
+		t.Fatalf("truncate stream: %v", err)
+	}
+	f.Close()
+	got = readStream("f.txt:meta")
+	if want := append(append([]byte{}, first...), second[:500]...); !bytes.Equal(got, want) {
+		t.Fatalf("stream after truncate: %d bytes, want %d", len(got), len(want))
+	}
+
+	// A stream larger than any xattr can hold must report an error.
+	big := bytes.Repeat([]byte("C"), 200_000)
+	if err := fs.WriteFile("f.txt:huge", big, 0o644); err == nil {
+		if back := readStream("f.txt:huge"); !bytes.Equal(back, big) {
+			t.Fatalf("200 KB stream write reported success but reads back %d bytes", len(back))
+		}
+	}
+	if main, _ := fs.ReadFile("f.txt"); string(main) != "main" {
+		t.Fatalf("main data stream changed: %q", main)
 	}
 }
