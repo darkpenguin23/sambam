@@ -221,15 +221,27 @@ func (fs *PassthroughFS) SetAttr(handle vfs.VfsHandle, a *vfs.Attributes) (*vfs.
 	return nil, nil
 }
 
+// diskUsage is the size of the filesystem holding a share, in blockSize units.
+type diskUsage struct {
+	blockSize, blocks, free, avail, files, freeFiles uint64
+}
+
+// StatFS reports the real size and free space of the filesystem holding the
+// share (it used to report fixed values: about 40 GB total and 4 GB free,
+// so clients refused larger copies or showed wrong free space).
 func (fs *PassthroughFS) StatFS(handle vfs.VfsHandle) (*vfs.FSAttributes, error) {
+	u, err := diskStats(fs.rootPath)
+	if err != nil || u.blockSize == 0 {
+		// Fall back to the former fixed values.
+		u = diskUsage{blockSize: 4096, blocks: 10000000, free: 1000000, avail: 1000000, files: 1000000, freeFiles: 1000000}
+	}
 	a := vfs.FSAttributes{}
-	// Return some reasonable defaults
-	a.SetAvailableBlocks(1000000)
-	a.SetBlockSize(4096)
-	a.SetBlocks(10000000)
-	a.SetFiles(1000000)
-	a.SetFreeBlocks(1000000)
-	a.SetFreeFiles(1000000)
+	a.SetAvailableBlocks(u.avail)
+	a.SetBlockSize(u.blockSize)
+	a.SetBlocks(u.blocks)
+	a.SetFiles(u.files)
+	a.SetFreeBlocks(u.free)
+	a.SetFreeFiles(u.freeFiles)
 	a.SetIOSize(4096)
 	return &a, nil
 }

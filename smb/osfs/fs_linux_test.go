@@ -98,3 +98,25 @@ func TestXattrRoundTripAndNoFollow(t *testing.T) {
 		t.Fatalf("xattr was written through the symlink to the outside file (size %d)", sz)
 	}
 }
+
+func TestStatFSReportsRealDisk(t *testing.T) {
+	fs, share, _ := newTestFS(t, false)
+	var st unix.Statfs_t
+	if err := unix.Statfs(share, &st); err != nil {
+		t.Fatal(err)
+	}
+	a, err := fs.StatFS(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks, _ := a.GetBlocks()
+	bs, _ := a.GetBlockSize()
+	if blocks != st.Blocks || bs != uint64(st.Frsize) {
+		t.Fatalf("StatFS = %d blocks of %d, statfs = %d blocks of %d", blocks, bs, st.Blocks, st.Frsize)
+	}
+	avail, _ := a.GetAvailableBlocks()
+	// Free space moves while tests run; it must be in the right ballpark.
+	if diff := int64(avail) - int64(st.Bavail); diff > 1<<16 || diff < -(1<<16) {
+		t.Fatalf("available blocks %d vs statfs %d", avail, st.Bavail)
+	}
+}
