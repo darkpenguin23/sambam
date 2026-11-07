@@ -14,6 +14,16 @@ func CompatStat(stat os.FileInfo) (Stat, bool) {
 		return Stat{}, false
 	}
 
+	mtime := time.Unix(int64(sysStat.Mtim.Sec), int64(sysStat.Mtim.Nsec))
+	ctime := time.Unix(int64(sysStat.Ctim.Sec), int64(sysStat.Ctim.Nsec))
+	// stat(2) has no birth time. Like Samba without statx btime, report the
+	// earlier of mtime and ctime instead of 1970-01-01, which Windows shows
+	// as the creation date.
+	btime := mtime
+	if ctime.Before(btime) {
+		btime = ctime
+	}
+
 	s := Stat{
 		Ino:     sysStat.Ino,
 		Blocks:  sysStat.Blocks,
@@ -23,9 +33,9 @@ func CompatStat(stat os.FileInfo) (Stat, bool) {
 		Gid:     sysStat.Gid,
 		Nlink:   uint32(sysStat.Nlink),
 		Atime:   time.Unix(int64(sysStat.Atim.Sec), int64(sysStat.Atim.Nsec)),
-		Mtime:   time.Unix(int64(sysStat.Mtim.Sec), int64(sysStat.Mtim.Nsec)),
-		Ctime:   time.Unix(int64(sysStat.Ctim.Sec), int64(sysStat.Ctim.Nsec)),
-		Btime:   time.Unix(0, 0),
+		Mtime:   mtime,
+		Ctime:   ctime,
+		Btime:   btime,
 	}
 
 	return s, true

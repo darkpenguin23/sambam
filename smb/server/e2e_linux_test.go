@@ -105,26 +105,30 @@ func TestE2EStreamWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	fs := e.mustMount(t, "alice", "alicepw")
-	// Read a stream the way Windows does: ask for its size, read exactly
-	// that much. (At the end of a stream the server answers READ with
-	// success and 0 bytes - a deliberate Explorer workaround - so clients
-	// that read until STATUS_END_OF_FILE, like go-smb2's ReadFile, loop.)
+	// Read a stream until STATUS_END_OF_FILE, like go-smb2's ReadFile. (The
+	// server used to answer success with 0 bytes at the end, which made such
+	// clients loop forever - hence the timeout.)
 	readStream := func(name string) []byte {
 		t.Helper()
-		f, err := fs.Open(name)
-		if err != nil {
-			t.Fatalf("open %s: %v", name, err)
+		type result struct {
+			data []byte
+			err  error
 		}
-		defer f.Close()
-		fi, err := f.Stat()
-		if err != nil {
-			t.Fatalf("stat %s: %v", name, err)
+		done := make(chan result, 1)
+		go func() {
+			data, err := fs.ReadFile(name)
+			done <- result{data, err}
+		}()
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatalf("read %s: %v", name, r.err)
+			}
+			return r.data
+		case <-time.After(10 * time.Second):
+			t.Fatalf("reading %s until EOF does not terminate", name)
 		}
-		buf := make([]byte, fi.Size())
-		if _, err := f.ReadAt(buf, 0); err != nil && len(buf) > 0 {
-			t.Fatalf("read %s: %v", name, err)
-		}
-		return buf
+		return nil
 	}
 
 	f, err := fs.OpenFile("f.txt:meta", os.O_RDWR|os.O_CREATE, 0o644)

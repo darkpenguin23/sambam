@@ -461,59 +461,55 @@ func (t *fileTree) handleRqLs(pkt []byte, open *Open) (Encoder, error) {
 	return nil, nil
 }
 
+// handleCreateEA applies the create disposition to a named stream, with the
+// semantics NTFS has (MS-FSA 2.1.5.1.2.1). In particular, opening a stream
+// that does not exist fails: creating it instead (as earlier versions did
+// "for Windows probes") made every probe - Explorer and SmartScreen look for
+// Zone.Identifier and others on each file - leave an empty stream behind,
+// and Get-Content -Stream of a missing stream returned empty content.
 func (t *fileTree) handleCreateEA(disp uint32, h vfs.VfsHandle, eaKey string) (uint32, error) {
-	var err error = nil
-	status := uint32(0)
-
 	// special cases for Apple
 	if eaKey == "AFP_AfpInfo" {
 		return 0, nil
 	}
 
+	_, err := t.fs.Getxattr(h, eaKey, nil)
+	exists := err == nil
+
 	switch disp {
-	case FILE_OPEN_IF:
-		// open or create
-		if _, err = t.fs.Getxattr(h, eaKey, nil); err != nil {
-			if err = t.fs.Setxattr(h, eaKey, nil); err != nil {
-				status = uint32(STATUS_OPEN_FAILED)
-			}
-		}
 	case FILE_OPEN:
-		// open existing; if missing, create empty ADS to satisfy Windows probes
-		if _, err = t.fs.Getxattr(h, eaKey, nil); err != nil {
-			if err = t.fs.Setxattr(h, eaKey, nil); err != nil {
-				status = uint32(STATUS_OBJECT_NAME_NOT_FOUND)
-			} else {
-				err = nil
-			}
+		if !exists {
+			return uint32(STATUS_OBJECT_NAME_NOT_FOUND), errNoStream
+		}
+		return 0, nil
+	case FILE_OPEN_IF:
+		if exists {
+			return 0, nil
 		}
 	case FILE_CREATE:
-		// if exists fail, otherwise create
-		if _, err = t.fs.Getxattr(h, eaKey, nil); err == nil {
-			status = uint32(STATUS_OBJECT_NAME_EXISTS)
-			err = fmt.Errorf("already exists")
-			break
-		}
-		if err = t.fs.Setxattr(h, eaKey, nil); err != nil {
-			status = uint32(STATUS_OPEN_FAILED)
+		if exists {
+			return uint32(STATUS_OBJECT_NAME_COLLISION), fmt.Errorf("stream %s already exists", eaKey)
 		}
 	case FILE_OVERWRITE:
-		// error if doesn't exists
-		if _, err = t.fs.Getxattr(h, eaKey, nil); err != nil {
-			status = uint32(STATUS_OBJECT_NAME_NOT_FOUND)
-		}
-		if err = t.fs.Setxattr(h, eaKey, nil); err != nil {
-			status = uint32(STATUS_OPEN_FAILED)
+		if !exists {
+			return uint32(STATUS_OBJECT_NAME_NOT_FOUND), errNoStream
 		}
 	case FILE_SUPERSEDE, FILE_OVERWRITE_IF:
-		err = t.fs.Setxattr(h, eaKey, nil)
+	default:
+		return uint32(STATUS_INVALID_PARAMETER), fmt.Errorf("create disposition %d", disp)
 	}
 
-	if err != nil && status == 0 {
-		status = uint32(STATUS_OPEN_FAILED)
+	// Create the stream, or truncate it for the overwrite dispositions.
+	if err := t.fs.Setxattr(h, eaKey, nil); err != nil {
+		if status := streamWriteStatus(err); status == uint32(STATUS_DISK_FULL) {
+			return status, err
+		}
+		return uint32(STATUS_OPEN_FAILED), err
 	}
-	return status, err
+	return 0, nil
 }
+
+var errNoStream = errors.New("no such stream")
 
 // https://github.com/openzfs/openzfs/blob/master/usr/src/uts/common/smbsrv/smb2_aapl.h
 func (t *fileTree) handleAAPLCC(pkt []byte) (Encoder, error) {
@@ -695,15 +691,11 @@ func (t *fileTree) readEA(ctx *compoundContext, fileId *FileId, open *Open, pkt 
 			status = uint32(STATUS_ACCESS_DENIED)
 		}
 	} else if total == 0 || int64(off) >= int64(total) {
-		// For ADS/xattr stream reads, return success with zero-length payload
-		// at/end-of-stream. Explorer probes Zone.Identifier repeatedly and is
-		// sensitive to EOF-style error statuses here.
-		rsp := new(ReadResponse)
-		PrepareResponse(&rsp.PacketHeader, pkt, 0)
-		rsp.DataRemaining = 0
-		rsp.Data = nil
+		// At the end of a stream, as at the end of a file: STATUS_END_OF_FILE.
+		// (Earlier versions answered success with 0 bytes, which sends
+		// clients that read until EOF into an endless loop.)
 		log.Tracef("readEA rsp: file=%s stream=%s n=0 eof=true", open.pathName, open.eaKey)
-		return c.sendPacket(rsp, &t.treeConn, ctx)
+		status = uint32(STATUS_END_OF_FILE)
 	} else {
 		full := make([]byte, total)
 		nfull, err := t.fs.Getxattr(vfs.VfsHandle(fileId.HandleId()), open.eaKey, full)
@@ -2136,17 +2128,22 @@ func (t *fileTree) queryInfoFile(ctx *compoundContext, pkt []byte) error {
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
+	status := uint32(0)
 	if info != nil {
 		need := info.Size()
 		if need > int(r.OutputBufferLength()) {
-			rsp := new(ErrorResponse)
-			PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INFO_LENGTH_MISMATCH))
-			return c.sendPacket(rsp, &t.treeConn, ctx)
+			partial, ok := truncateFileInfo(r.FileInfoClass(), info, int(r.OutputBufferLength()))
+			if !ok {
+				rsp := new(ErrorResponse)
+				PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INFO_LENGTH_MISMATCH))
+				return c.sendPacket(rsp, &t.treeConn, ctx)
+			}
+			info, status = partial, uint32(STATUS_BUFFER_OVERFLOW)
 		}
 	}
 
 	rsp := new(QueryInfoResponse)
-	PrepareResponse(&rsp.PacketHeader, pkt, 0)
+	PrepareResponse(&rsp.PacketHeader, pkt, status)
 	rsp.Output = info
 
 	return c.sendPacket(rsp, &t.treeConn, ctx)
@@ -2260,30 +2257,39 @@ func (t *fileTree) setBasicInfo(ctx *compoundContext, fileId *FileId, open *Open
 	info := FileBasicInformationInfoDecoder(r.Buffer())
 
 	a := new(vfs.Attributes)
+	if len(r.Buffer()) < 36 {
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INFO_LENGTH_MISMATCH))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 
-	ns := info.LastAccessTime().Nanoseconds()
-	if ns != 0 {
-		seconds := ns / 1e9
-		nanoseconds := ns % 1e9
-		a.SetAccessTime(time.Unix(seconds, nanoseconds))
+	times := []struct {
+		ft  *Filetime
+		set func(time.Time) *vfs.Attributes
+	}{
+		{info.LastAccessTime(), a.SetAccessTime},
+		{info.LastWriteTime(), a.SetLastDataModificationTime},
+		{info.ChangeTime(), a.SetLastStatusChangeTime},
+		{info.CreationTime(), a.SetBirthTime},
 	}
-	ns = info.LastWriteTime().Nanoseconds()
-	if ns != 0 {
-		seconds := ns / 1e9
-		nanoseconds := ns % 1e9
-		a.SetLastDataModificationTime(time.Unix(seconds, nanoseconds))
+	for _, tm := range times {
+		when, set, valid := basicInfoTime(tm.ft)
+		if !valid {
+			rsp := new(ErrorResponse)
+			PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INVALID_PARAMETER))
+			return c.sendPacket(rsp, &t.treeConn, ctx)
+		}
+		if set {
+			tm.set(when)
+		}
 	}
-	ns = info.ChangeTime().Nanoseconds()
-	if ns != 0 {
-		seconds := ns / 1e9
-		nanoseconds := ns % 1e9
-		a.SetLastStatusChangeTime(time.Unix(seconds, nanoseconds))
-	}
-	ns = info.CreationTime().Nanoseconds()
-	if ns != 0 {
-		seconds := ns / 1e9
-		nanoseconds := ns % 1e9
-		a.SetBirthTime(time.Unix(seconds, nanoseconds))
+
+	if attrs := info.FileAttributes(); attrs != 0 && !open.isEa {
+		if cur, err := t.fs.GetAttr(vfs.VfsHandle(fileId.HandleId())); err == nil {
+			if mode, change := readOnlyMode(cur, attrs); change {
+				a.SetUnixMode(mode)
+			}
+		}
 	}
 
 	if !open.isEa {
@@ -2319,6 +2325,64 @@ func (t *fileTree) setEndOfFileInfo(ctx *compoundContext, fileId *FileId, open *
 	rsp := new(SetInfoResponse)
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)
 	return c.sendPacket(rsp, &t.treeConn, ctx)
+}
+
+// setAllocationInfo handles FileAllocationInformation. Space is not
+// preallocated, but an allocation size below the end of file truncates the
+// file (MS-FSA 2.1.5.15.1). Windows implements TRUNCATE_EXISTING (and with it
+// FileMode.Truncate, Clear-Content, PowerShell 5 Set-Content) as an open
+// followed by this call with size 0, so ignoring it leaves the old data.
+func (t *fileTree) setAllocationInfo(ctx *compoundContext, fileId *FileId, open *Open, pkt []byte) error {
+	c := t.session.conn
+
+	res, _ := accept(SMB2_SET_INFO, pkt)
+	r := SetInfoRequestDecoder(res)
+	buf := r.Buffer()
+	if len(buf) < 8 {
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_INFO_LENGTH_MISMATCH))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+	allocation := le.Uint64(buf)
+	h := vfs.VfsHandle(fileId.HandleId())
+
+	open.ioMu.Lock()
+	status, err := t.shrinkToAllocation(h, open, allocation)
+	open.ioMu.Unlock()
+	if err != nil {
+		log.Errorf("set allocation size %d failed: %v", allocation, err)
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, status)
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+
+	rsp := new(SetInfoResponse)
+	PrepareResponse(&rsp.PacketHeader, pkt, 0)
+	return c.sendPacket(rsp, &t.treeConn, ctx)
+}
+
+func (t *fileTree) shrinkToAllocation(h vfs.VfsHandle, open *Open, allocation uint64) (uint32, error) {
+	if open.isEa {
+		n, err := t.fs.Getxattr(h, open.eaKey, nil)
+		if err != nil || uint64(n) <= allocation {
+			return 0, nil
+		}
+		if err := t.resizeStream(h, open.eaKey, int64(allocation)); err != nil {
+			return streamWriteStatus(err), err
+		}
+		return 0, nil
+	}
+	a, err := t.fs.GetAttr(h)
+	if err != nil {
+		return uint32(STATUS_INVALID_HANDLE), err
+	}
+	if a.GetFileType() == vfs.FileTypeDirectory || SizeFromVfs(a) <= allocation {
+		return 0, nil
+	}
+	if err := t.fs.Truncate(h, allocation); err != nil {
+		return uint32(STATUS_ACCESS_DENIED), err
+	}
+	return 0, nil
 }
 
 func (t *fileTree) setEndOfFileInfoEa(ctx *compoundContext, fileId *FileId, open *Open, eaKey string, pkt []byte) error {
@@ -2428,7 +2492,7 @@ func (t *fileTree) setRename(ctx *compoundContext, fileId *FileId, pkt []byte) e
 	if err := t.fs.Rename(vfs.VfsHandle(fileId.HandleId()), to, int(info.ReplaceIfExists())); err != nil {
 		log.Errorf("rename failed: %v", err)
 		rsp := new(ErrorResponse)
-		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(renameErrorStatus(err)))
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
@@ -2693,9 +2757,7 @@ func (t *fileTree) setInfo(ctx *compoundContext, pkt []byte) error {
 	case FilePosixInformation:
 		return t.setPosixInfo(ctx, fileId, pkt)
 	case FileAllocationInformation:
-		rsp := &SetInfoResponse{}
-		PrepareResponse(&rsp.PacketHeader, pkt, 0)
-		return c.sendPacket(rsp, &t.treeConn, ctx)
+		return t.setAllocationInfo(ctx, fileId, open, pkt)
 	default:
 		status = uint32(STATUS_NOT_SUPPORTED)
 		log.Errorf("unsupported class %d in SetInfo", r.FileInfoClass())

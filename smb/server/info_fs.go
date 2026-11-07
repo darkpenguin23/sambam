@@ -327,7 +327,7 @@ func (i FileNamesInformationInfo) Size() int {
 
 func (i FileNamesInformationInfo) Encode(pkt []byte) {
 	le.PutUint32(pkt[0:], i.NextEntryOffset)
-	le.PutUint64(pkt[4:], uint64(i.FileIndex))
+	le.PutUint32(pkt[4:], uint32(i.FileIndex))
 	le.PutUint32(pkt[8:], uint32(utf16le.EncodedStringLen(i.FileName)))
 	utf16le.EncodeString(pkt[12:], i.FileName)
 }
@@ -470,7 +470,7 @@ func (i *FileFsFullSizeInformationInfo) Size() int {
 func (i *FileFsFullSizeInformationInfo) Encode(pkt []byte) {
 	le.PutUint64(pkt[0:], uint64(i.TotalAllocationUnits))
 	le.PutUint64(pkt[8:], uint64(i.CallerAvailableAllocationUnits))
-	le.PutUint64(pkt[18:], uint64(i.ActualAvailableAllocationUnits))
+	le.PutUint64(pkt[16:], uint64(i.ActualAvailableAllocationUnits))
 	le.PutUint32(pkt[24:], i.SectorsPerAllocationUnit)
 	le.PutUint32(pkt[28:], i.BytesPerSector)
 }

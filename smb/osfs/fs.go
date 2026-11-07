@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/sambam/sambam/smb/vfs"
@@ -696,9 +697,15 @@ func (fs *PassthroughFS) Rename(from vfs.VfsHandle, to string, flags int) error 
 	}
 
 	newPath := relName(to)
-	if flags == 0 {
-		if _, err := r.Lstat(newPath); err == nil {
-			return fmt.Errorf("already exists")
+	// A target that is the source itself (same name, or a case-only rename
+	// on a case-insensitive filesystem) is not a collision.
+	if st, err := r.Lstat(newPath); err == nil && !sameFile(r, open.path, st) {
+		if flags == 0 {
+			return &os.LinkError{Op: "rename", Old: open.path, New: newPath, Err: os.ErrExist}
+		}
+		// Like NTFS, never replace a directory (Linux would replace an empty one).
+		if st.IsDir() {
+			return &os.LinkError{Op: "rename", Old: open.path, New: newPath, Err: syscall.EISDIR}
 		}
 	}
 
@@ -707,6 +714,12 @@ func (fs *PassthroughFS) Rename(from vfs.VfsHandle, to string, flags int) error 
 	}
 	open.path = newPath
 	return nil
+}
+
+// sameFile reports whether st describes the file at rel.
+func sameFile(r *os.Root, rel string, st os.FileInfo) bool {
+	src, err := r.Lstat(rel)
+	return err == nil && os.SameFile(src, st)
 }
 
 func (fs *PassthroughFS) Symlink(targetHandle vfs.VfsHandle, target string, flag int) (*vfs.Attributes, error) {
