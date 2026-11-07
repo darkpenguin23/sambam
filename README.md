@@ -40,6 +40,8 @@ Done. They open `\\your-ip\share` in Explorer. Files are flowing. You're a hero.
 - **Auto-expire** - Stop sharing automatically after a duration
 - **Daemon mode** - Run in background with `sambam status` / `sambam stop`
 - **Cross-platform clients** - Windows 10/11, macOS, Linux (CIFS mount)
+- **Windows-friendly names** - File and folder names are case-insensitive like on NTFS (`readme.txt` opens `README.TXT`), while the spelling is preserved
+- **Alternate data streams** - Stored as extended attributes (keeps e.g. the "downloaded from the Internet" mark Windows adds)
 - **SMB 2.1 / 3.0 / 3.1.1** - Modern protocol support, including POSIX extensions
 - **Single binary** - Runs on Linux distributions (Debian, Ubuntu, OpenWrt, etc.)
 - **Shell completions** - Bash and Fish completion scripts included
@@ -519,6 +521,14 @@ These notes apply to the **sambam server** (the application serving files), not 
 - File deletion issues: Files cannot be deleted while the server is running (Windows file locking behavior)
 - Other features work correctly
 
+### Limitations
+
+- **Byte-range locks are not enforced** - Lock requests always succeed; two clients editing the same file at once are not stopped by the server.
+- **Flush does not sync to disk** - Data reaches the disk when the OS writes it back, not when the client flushes.
+- **Alternate data streams are small** - They live in extended attributes, which ext4 limits to about 4 KB per file; a larger stream is rejected with "disk full". Windows PowerShell 5.1 may crash a little later after such an error.
+- **Only the read-only attribute is stored** - Hidden, system and archive set from Windows are not kept (use `--hide-dotfiles` to hide dotfiles).
+- **Case-insensitive lookup costs a directory scan** - only for names that do not exist exactly as given (mostly new files): about 2 ms per new file in a folder with 10,000 entries. If a folder holds names differing only in case (possible on Linux), clients see both in listings, but a name that matches neither exactly opens the alphabetically first one.
+
 ## Security Notice
 
 By default, sambam uses anonymous/guest authentication. This means:
@@ -526,6 +536,8 @@ By default, sambam uses anonymous/guest authentication. This means:
 - **No passwords** - Anyone on your network can access the share
 - **Use on trusted networks only** - Don't run this on public WiFi
 - **Not for production** - This is for quick file transfers, not Fort Knox
+
+Clients can only reach files inside the shared directory: `..` paths and symlinks pointing outside it (including symlinks created by clients) are not followed by the server.
 
 For sensitive shares, use `--username` to require authentication, and `-r` for read-only mode.
 
