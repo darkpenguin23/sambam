@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -36,8 +37,8 @@ type Server struct {
 	serverStartTime time.Time
 	serverGuid      Guid
 
-	listeners []net.Listener
-	active    bool
+	listeners []net.Listener // guarded by lock
+	active    atomic.Bool    // read by accept loops, cleared by Shutdown from other goroutines
 
 	shares     map[string]vfs.VFSFileSystem
 	origShares map[string]vfs.VFSFileSystem
@@ -313,13 +314,15 @@ func (d *Server) ServeMany(addrs []string) error {
 		}
 		listeners = append(listeners, listener)
 	}
+	d.lock.Lock()
 	d.listeners = listeners
+	d.lock.Unlock()
 	defer func() {
 		for _, l := range listeners {
 			_ = l.Close()
 		}
 	}()
-	d.active = true
+	d.active.Store(true)
 
 	if d.fsWatcher != nil {
 		d.startFsWatcher()
@@ -338,11 +341,11 @@ func (d *Server) ServeMany(addrs []string) error {
 }
 
 func (d *Server) serveListener(listener net.Listener) {
-	for d.active {
+	for d.active.Load() {
 		// Accept a new connection.
 		c, err := listener.Accept()
 		if err != nil {
-			if !d.active {
+			if !d.active.Load() {
 				return
 			}
 			continue
@@ -399,14 +402,14 @@ func (d *Server) serveListener(listener net.Listener) {
 		go conn.runSender()
 
 		run := func() {
-			if err := conn.Run(); err != nil {
+			if err := conn.runGuarded(); err != nil {
 				if !isNormalDisconnect(err) {
 					conn.errorf("err: %v", err)
 				}
 				conn.infof("disconnect")
 				c.Close()
 				if d.acceptSingleConn {
-					d.active = false
+					d.active.Store(false)
 				}
 			}
 		}
@@ -420,8 +423,11 @@ func (d *Server) serveListener(listener net.Listener) {
 }
 
 func (d *Server) Shutdown() {
-	d.active = false
-	for _, l := range d.listeners {
+	d.active.Store(false)
+	d.lock.Lock()
+	listeners := d.listeners
+	d.lock.Unlock()
+	for _, l := range listeners {
 		_ = l.Close()
 	}
 	if d.fsWatcher != nil {
@@ -789,7 +795,13 @@ func (c *conn) treeDisconnect(pkt []byte) error {
 	return c.sendPacket(rsp, tree, nil)
 }
 
-func (n *ServerNegotiator) negotiate(conn *conn, pkt []byte) error {
+func (shared *ServerNegotiator) negotiate(conn *conn, pkt []byte) error {
+	// The Server holds a single ServerNegotiator for all connections. Work on
+	// a per-call copy so concurrent negotiations cannot overwrite each
+	// other's dialect or SPNEGO state.
+	local := *shared
+	n := &local
+
 	p := PacketCodec(pkt)
 	if p.IsSmb1() {
 		n.SpecifiedDialect = SMB2
@@ -835,6 +847,7 @@ func (n *ServerNegotiator) negotiate(conn *conn, pkt []byte) error {
 	// copy(conn.serverGuid[:], r.ServerGuid())
 
 	n.Spnego = newSpnegoServer([]Authenticator{conn.serverCtx.authenticator})
+	conn.spnego = n.Spnego
 	outputToken, _ := n.Spnego.initSecContext()
 	signingMode := "optional"
 	if conn.requireSigning {
@@ -1106,7 +1119,10 @@ func (c *conn) sessionServerSetup(pkt []byte) error {
 		return &InvalidRequestError{"request security mode doesn't match connection requirement"}
 	}*/
 
-	outputToken, err := c.serverCtx.negotiator.Spnego.challenge(r.SecurityBuffer())
+	if c.spnego == nil {
+		return &InvalidRequestError{"session setup before negotiate"}
+	}
+	outputToken, err := c.spnego.challenge(r.SecurityBuffer())
 	if err != nil {
 		c.warnf("session setup challenge failed: %v", err)
 		rsp := new(ErrorResponse)
@@ -1152,7 +1168,10 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 
 	c.calcPreauthHash(pkt)
 
-	outputToken, user, err := c.serverCtx.negotiator.Spnego.authenticate(r.SecurityBuffer())
+	if c.spnego == nil {
+		return &InvalidRequestError{"session setup before negotiate"}
+	}
+	outputToken, user, err := c.spnego.authenticate(r.SecurityBuffer())
 	if err != nil {
 		if c.serverCtx.onAuthFail != nil {
 			c.serverCtx.onAuthFail(c.remoteAddr, authFailedUserFromError(err))
@@ -1166,7 +1185,7 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 	}
 
 	if err == nil {
-		if ntlmAuth, ok := c.serverCtx.negotiator.Spnego.selectedMech.(*NTLMAuthenticator); ok {
+		if ntlmAuth, ok := c.spnego.selectedMech.(*NTLMAuthenticator); ok {
 			c.observeNTLMInfo(ntlmAuth.infoMap())
 		}
 	}
@@ -1203,7 +1222,7 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 	rsp.SecurityBuffer = outputToken
 
 	if s.sessionFlags&(SMB2_SESSION_FLAG_IS_GUEST|SMB2_SESSION_FLAG_IS_NULL) == 0 {
-		sessionKey := c.serverCtx.negotiator.Spnego.sessionKey()
+		sessionKey := c.spnego.sessionKey()
 		if err := c.deriveSessionKeys(s, sessionKey, c.preauthIntegrityHashValue); err != nil {
 			return err
 		}
@@ -1219,10 +1238,14 @@ func (c *conn) sessionServerSetupChallenge(pkt []byte) error {
 	// Set session before sending final SESSION_SETUP so response can be signed.
 	c.setSession(s)
 	c.serverState = STATE_SESSION_ACTIVE
-	if err = c.sendPacket(rsp, nil, nil); err == nil {
-		c.enableSession()
-	}
-	return err
+	// Enable the session *before* the response leaves: the client may send
+	// its first (encrypted) request as soon as it sees the response, and the
+	// receiver goroutine only decrypts once the session is enabled. Enabling
+	// afterwards let such a request be dropped as "broken packet header",
+	// leaving the client waiting forever. The SESSION_SETUP response itself
+	// stays plaintext (see protectPacket).
+	c.enableSession()
+	return c.sendPacket(rsp, nil, nil)
 }
 
 // deriveSessionKeys sets up signing, encryption and decryption keys on

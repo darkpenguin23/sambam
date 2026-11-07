@@ -7,6 +7,7 @@ require (
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/geoffgarside/ber v1.2.0
 	github.com/grandcat/zeroconf v1.0.0
+	github.com/hirochachacha/go-smb2 v1.1.0
 	github.com/sevlyar/go-daemon v0.1.6
 	github.com/sirupsen/logrus v1.9.4
 	github.com/spf13/pflag v1.0.10

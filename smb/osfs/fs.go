@@ -34,10 +34,17 @@ type OpenFile struct {
 	ioWG        sync.WaitGroup
 }
 
+// PassthroughFS exposes a host directory as a VFS. Every filesystem access
+// goes through an os.Root, so client-supplied names can never resolve to a
+// location outside rootPath — neither via ".." nor via symlinks (including
+// symlinks created by clients). OpenFile.path is always relative to the root.
 type PassthroughFS struct {
 	rootPath  string
 	readOnly  bool
 	openFiles sync.Map
+
+	rootMu sync.Mutex
+	root   atomic.Pointer[os.Root]
 
 	// Debug callbacks
 	OnCreate    func(path string, isDir bool)
@@ -59,10 +66,52 @@ func (fs *PassthroughFS) IsReadOnly() bool {
 	return fs.readOnly
 }
 
-func (fs *PassthroughFS) relativePath(fullPath string) string {
-	rel := strings.TrimPrefix(fullPath, fs.rootPath)
-	rel = strings.TrimPrefix(rel, "/")
+// openRoot returns the share root, opening it on first use. Opening lazily
+// keeps NewPassthroughFS infallible and lets a share directory that does not
+// exist yet at startup become usable once it is created.
+func (fs *PassthroughFS) openRoot() (*os.Root, error) {
+	if r := fs.root.Load(); r != nil {
+		return r, nil
+	}
+	fs.rootMu.Lock()
+	defer fs.rootMu.Unlock()
+	if r := fs.root.Load(); r != nil {
+		return r, nil
+	}
+	r, err := os.OpenRoot(fs.rootPath)
+	if err != nil {
+		return nil, err
+	}
+	fs.root.Store(r)
+	return r, nil
+}
+
+// relName converts a VFS path ("/", "dir/file", "/dir/file/") into a name
+// relative to the share root as expected by os.Root ("." for the root).
+// ".." is cleaned lexically; anything that still escapes is rejected by
+// os.Root.
+func relName(p string) string {
+	return path.Join(".", p)
+}
+
+// displayPath is the share-relative path handed to the debug callbacks;
+// the share root is reported as "" as before.
+func displayPath(rel string) string {
+	if rel == "." {
+		return ""
+	}
 	return rel
+}
+
+func (fs *PassthroughFS) loadOpen(handle vfs.VfsHandle) (*OpenFile, error) {
+	if handle == 0 {
+		return nil, fmt.Errorf("bad handle")
+	}
+	v, ok := fs.openFiles.Load(handle)
+	if !ok {
+		return nil, fmt.Errorf("bad handle")
+	}
+	return v.(*OpenFile), nil
 }
 
 func openMode(flags int) string {
@@ -84,7 +133,11 @@ func NewPassthroughFS(rootPath string, readOnly bool) *PassthroughFS {
 }
 
 func (fs *PassthroughFS) GetAttr(handle vfs.VfsHandle) (*vfs.Attributes, error) {
-	p := fs.rootPath
+	r, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	p := "."
 	if handle != 0 {
 		v, ok := fs.openFiles.Load(handle)
 		if !ok {
@@ -99,7 +152,7 @@ func (fs *PassthroughFS) GetAttr(handle vfs.VfsHandle) (*vfs.Attributes, error) 
 		p = open.path
 	}
 
-	info, err := os.Lstat(p)
+	info, err := r.Lstat(p)
 	if err != nil {
 		return nil, err
 	}
@@ -121,6 +174,10 @@ func (fs *PassthroughFS) SetAttr(handle vfs.VfsHandle, a *vfs.Attributes) (*vfs.
 		return nil, fmt.Errorf("bad handle")
 	}
 	open := v.(*OpenFile)
+	r, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 
 	oldAttrs, err := fs.GetAttr(handle)
 	if err != nil {
@@ -137,13 +194,13 @@ func (fs *PassthroughFS) SetAttr(handle vfs.VfsHandle, a *vfs.Attributes) (*vfs.
 	}
 
 	if atimeSet || mtimeSet {
-		os.Chtimes(open.path, atime, mtime)
+		r.Chtimes(open.path, atime, mtime)
 	}
 
 	if mode, mSet := a.GetUnixMode(); mSet {
 		// Lstat to check if symlink — can't chmod symlinks on Linux
-		if info, err := os.Lstat(open.path); err == nil && info.Mode()&os.ModeSymlink == 0 {
-			os.Chmod(open.path, os.FileMode(mode&0777))
+		if info, err := r.Lstat(open.path); err == nil && info.Mode()&os.ModeSymlink == 0 {
+			r.Chmod(open.path, os.FileMode(mode&0777))
 		}
 	}
 
@@ -158,7 +215,7 @@ func (fs *PassthroughFS) SetAttr(handle vfs.VfsHandle, a *vfs.Attributes) (*vfs.
 		if gidSet {
 			chownGid = int(gid)
 		}
-		os.Lchown(open.path, chownUid, chownGid)
+		r.Lchown(open.path, chownUid, chownGid)
 	}
 
 	return nil, nil
@@ -201,20 +258,25 @@ func randHandle() uint64 {
 }
 
 func (fs *PassthroughFS) Open(p string, flags int, mode int) (vfs.VfsHandle, error) {
-	fullPath := path.Join(fs.rootPath, p)
+	r, err := fs.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	name := relName(p)
 	fileMode := openMode(flags)
 
 	// Check if file exists before opening (to detect creation)
 	isCreate := flags&os.O_CREATE != 0
-	_, existedBefore := os.Stat(fullPath)
+	_, existedBefore := r.Stat(name)
 
-	// If read-only, force read-only flags
+	// If read-only, strip every write/create flag. Other bits (e.g. the
+	// O_PATH|O_NOFOLLOW used to open a symlink itself) are kept.
 	if fs.readOnly {
-		flags = os.O_RDONLY
+		flags &^= os.O_WRONLY | os.O_RDWR | os.O_CREATE | os.O_TRUNC | os.O_APPEND | os.O_EXCL
 		fileMode = "read"
 	}
 
-	f, err := os.OpenFile(fullPath, flags, os.FileMode(mode))
+	f, err := r.OpenFile(name, flags, os.FileMode(mode))
 	if err != nil {
 		return 0, err
 	}
@@ -227,10 +289,10 @@ func (fs *PassthroughFS) Open(p string, flags int, mode int) (vfs.VfsHandle, err
 	}
 
 	h := vfs.VfsHandle(randHandle())
-	fs.openFiles.Store(h, &OpenFile{f: f, h: h, path: fullPath, mode: fileMode})
+	fs.openFiles.Store(h, &OpenFile{f: f, h: h, path: name, mode: fileMode})
 
 	if fs.OnOpen != nil {
-		fs.OnOpen(fs.relativePath(fullPath), fileMode)
+		fs.OnOpen(displayPath(name), fileMode)
 	}
 
 	return h, nil
@@ -258,7 +320,7 @@ func (fs *PassthroughFS) Close(handle vfs.VfsHandle) error {
 	open.statsMu.Unlock()
 
 	if fs.OnClose != nil && (hadRead || hadWrite) {
-		fs.OnClose(fs.relativePath(open.path), mode, readBytes, writeBytes)
+		fs.OnClose(displayPath(open.path), mode, readBytes, writeBytes)
 	}
 
 	fs.openFiles.Delete(handle)
@@ -267,7 +329,11 @@ func (fs *PassthroughFS) Close(handle vfs.VfsHandle) error {
 }
 
 func (fs *PassthroughFS) Lookup(handle vfs.VfsHandle, name string) (*vfs.Attributes, error) {
-	p := fs.rootPath
+	r, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	p := "."
 	if handle != 0 {
 		v, ok := fs.openFiles.Load(handle)
 		if !ok {
@@ -277,14 +343,14 @@ func (fs *PassthroughFS) Lookup(handle vfs.VfsHandle, name string) (*vfs.Attribu
 		p = open.path
 	}
 
-	fullPath := path.Join(p, name)
+	target := relName(path.Join(p, name))
 	// For share root lookups, follow symlinks so roots like /bin -> /usr/bin
 	// are treated as directories by SMB clients.
-	lookup := os.Lstat
-	if handle == 0 && path.Clean(fullPath) == path.Clean(fs.rootPath) {
-		lookup = os.Stat
+	lookup := r.Lstat
+	if target == "." {
+		lookup = r.Stat
 	}
-	info, err := lookup(fullPath)
+	info, err := lookup(target)
 	if err != nil {
 		return nil, err
 	}
@@ -297,8 +363,12 @@ func (fs *PassthroughFS) Mkdir(p string, mode int) (*vfs.Attributes, error) {
 		return nil, fmt.Errorf("read-only share")
 	}
 
-	fullPath := path.Join(fs.rootPath, p)
-	if err := os.Mkdir(fullPath, os.FileMode(mode)); err != nil {
+	r, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	name := relName(p)
+	if err := r.Mkdir(name, os.FileMode(mode)); err != nil {
 		return nil, err
 	}
 
@@ -306,7 +376,7 @@ func (fs *PassthroughFS) Mkdir(p string, mode int) (*vfs.Attributes, error) {
 		fs.OnCreate(p, true)
 	}
 
-	info, err := os.Stat(fullPath)
+	info, err := r.Stat(name)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +408,7 @@ func (fs *PassthroughFS) Read(handle vfs.VfsHandle, buf []byte, offset uint64, f
 	n, err := open.f.ReadAt(buf, int64(offset))
 	duration := time.Since(start)
 	if n > 0 && fs.OnRead != nil {
-		relPath := fs.relativePath(open.path)
+		relPath := displayPath(open.path)
 		open.readOnce.Do(func() {
 			fs.OnRead(relPath)
 		})
@@ -350,7 +420,7 @@ func (fs *PassthroughFS) Read(handle vfs.VfsHandle, buf []byte, offset uint64, f
 		open.statsMu.Unlock()
 	}
 	if fs.OnSlowOp != nil && duration > 200*time.Millisecond {
-		fs.OnSlowOp("read", fs.relativePath(open.path), duration, n)
+		fs.OnSlowOp("read", displayPath(open.path), duration, n)
 	}
 	// If file was closed during read (race with Close), return EOF
 	if err != nil && (os.IsNotExist(err) || isClosedError(err)) {
@@ -403,23 +473,27 @@ func (fs *PassthroughFS) Write(handle vfs.VfsHandle, buf []byte, offset uint64, 
 		open.statsMu.Unlock()
 	}
 	if fs.OnSlowOp != nil && duration > 200*time.Millisecond {
-		fs.OnSlowOp("write", fs.relativePath(open.path), duration, n)
+		fs.OnSlowOp("write", displayPath(open.path), duration, n)
 	}
 	return n, err
 }
 
 func (fs *PassthroughFS) OpenDir(p string) (vfs.VfsHandle, error) {
-	fullPath := path.Join(fs.rootPath, p)
-	f, err := os.OpenFile(fullPath, os.O_RDONLY, 0)
+	r, err := fs.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	name := relName(p)
+	f, err := r.OpenFile(name, os.O_RDONLY, 0)
 	if err != nil {
 		return 0, err
 	}
 
 	h := vfs.VfsHandle(randHandle())
-	fs.openFiles.Store(h, &OpenFile{f: f, h: h, path: fullPath, isDir: true, mode: "dir"})
+	fs.openFiles.Store(h, &OpenFile{f: f, h: h, path: name, isDir: true, mode: "dir"})
 
 	if fs.OnDirOpen != nil {
-		fs.OnDirOpen(fs.relativePath(fullPath))
+		fs.OnDirOpen(displayPath(name))
 	}
 
 	return h, nil
@@ -438,7 +512,7 @@ func (fs *PassthroughFS) ReadDir(handle vfs.VfsHandle, pos int, maxEntries int) 
 
 	if open.isDir && fs.OnDirRead != nil {
 		open.dirReadOnce.Do(func() {
-			fs.OnDirRead(fs.relativePath(open.path))
+			fs.OnDirRead(displayPath(open.path))
 		})
 	}
 
@@ -485,7 +559,7 @@ func (fs *PassthroughFS) ReadDir(handle vfs.VfsHandle, pos int, maxEntries int) 
 		return nil, err
 	}
 	if fs.OnSlowOp != nil && duration > 200*time.Millisecond {
-		fs.OnSlowOp("query-dir", fs.relativePath(open.path), duration, len(entries))
+		fs.OnSlowOp("query-dir", displayPath(open.path), duration, len(entries))
 	}
 
 	for _, entry := range entries {
@@ -531,7 +605,11 @@ func (fs *PassthroughFS) Readlink(handle vfs.VfsHandle) (string, error) {
 		return "", fmt.Errorf("bad handle")
 	}
 	open := v.(*OpenFile)
-	return os.Readlink(open.path)
+	r, err := fs.openRoot()
+	if err != nil {
+		return "", err
+	}
+	return r.Readlink(open.path)
 }
 
 func (fs *PassthroughFS) Unlink(handle vfs.VfsHandle) error {
@@ -549,13 +627,14 @@ func (fs *PassthroughFS) Unlink(handle vfs.VfsHandle) error {
 	}
 	open := v.(*OpenFile)
 
-	// Get relative path for callback
-	relPath := strings.TrimPrefix(open.path, fs.rootPath)
-	relPath = strings.TrimPrefix(relPath, "/")
+	r, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 
-	err := os.Remove(open.path)
+	err = r.Remove(open.path)
 	if err == nil && fs.OnDelete != nil {
-		fs.OnDelete(relPath)
+		fs.OnDelete(displayPath(open.path))
 	}
 	return err
 }
@@ -573,7 +652,16 @@ func (fs *PassthroughFS) Truncate(handle vfs.VfsHandle, length uint64) error {
 	if open.f != nil {
 		return open.f.Truncate(int64(length))
 	}
-	return os.Truncate(open.path, int64(length))
+	r, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	f, err := r.OpenFile(open.path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Truncate(int64(length))
 }
 
 func (fs *PassthroughFS) Rename(from vfs.VfsHandle, to string, flags int) error {
@@ -590,15 +678,19 @@ func (fs *PassthroughFS) Rename(from vfs.VfsHandle, to string, flags int) error 
 		return fmt.Errorf("bad handle")
 	}
 	open := v.(*OpenFile)
+	r, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 
+	newPath := relName(to)
 	if flags == 0 {
-		if _, err := os.Lstat(path.Join(fs.rootPath, to)); err == nil {
+		if _, err := r.Lstat(newPath); err == nil {
 			return fmt.Errorf("already exists")
 		}
 	}
 
-	newPath := path.Join(fs.rootPath, to)
-	if err := os.Rename(open.path, newPath); err != nil {
+	if err := r.Rename(open.path, newPath); err != nil {
 		return err
 	}
 	open.path = newPath
@@ -618,20 +710,26 @@ func (fs *PassthroughFS) Symlink(targetHandle vfs.VfsHandle, target string, flag
 	}
 	open := v.(*OpenFile)
 	linkPath := open.path
+	r, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 
 	// Close and remove the placeholder file created by the CREATE request
 	if open.f != nil {
 		open.f.Close()
 		open.f = nil
 	}
-	os.Remove(linkPath)
+	r.Remove(linkPath)
 
-	// Create the actual symlink
-	if err := os.Symlink(target, linkPath); err != nil {
+	// Create the actual symlink. The target is stored verbatim (clients
+	// resolve symlinks themselves); os.Root guarantees the server never
+	// follows it outside the share.
+	if err := r.Symlink(target, linkPath); err != nil {
 		return nil, err
 	}
 
-	info, err := os.Lstat(linkPath)
+	info, err := r.Lstat(linkPath)
 	if err != nil {
 		return nil, err
 	}

@@ -13,6 +13,10 @@ type Authenticator interface {
 	authenticate(sc []byte) (string, error)
 	sum(bs []byte) []byte // GSS_getMIC
 	sessionKey() []byte   // QueryContextAttributes(ctx, SECPKG_ATTR_SESSION_KEY, &out)
+	// clone returns an authenticator with the same configuration and fresh
+	// handshake state. Authenticators are stateful (challenge, session key),
+	// so every authentication exchange must run on its own clone.
+	clone() Authenticator
 }
 
 // NTLMAuthenticator implements session-setup through NTLMv2.
@@ -28,6 +32,18 @@ type NTLMAuthenticator struct {
 
 	ntlm   *ntlm.Server
 	seqNum uint32
+}
+
+func (i *NTLMAuthenticator) clone() Authenticator {
+	return &NTLMAuthenticator{
+		UserPassword: i.UserPassword, // read-only after server start
+		TargetSPN:    i.TargetSPN,
+		NbDomain:     i.NbDomain,
+		NbName:       i.NbName,
+		DnsName:      i.DnsName,
+		DnsDomain:    i.DnsDomain,
+		AllowGuest:   i.AllowGuest,
+	}
 }
 
 func (i *NTLMAuthenticator) oid() asn1.ObjectIdentifier {

@@ -98,6 +98,7 @@ func (r *outstandingRequests) shutdown(err error) {
 }
 
 type conn struct {
+	spnego        *spnegoServer // authentication state of this connection (set by NEGOTIATE)
 	t             transport
 	remoteAddr    string
 	clientHost    string
@@ -407,6 +408,7 @@ func (conn *conn) srvRecv() ([]byte, *compoundContext, error) {
 }
 
 func (conn *conn) runSender() {
+	defer conn.recoverConn("sender")
 	for {
 		select {
 		case <-conn.wdone:
@@ -421,6 +423,7 @@ func (conn *conn) runSender() {
 }
 
 func (conn *conn) runReciever() {
+	defer conn.recoverConn("receiver")
 	var err error
 
 	for {

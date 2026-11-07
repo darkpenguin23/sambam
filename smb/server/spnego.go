@@ -14,9 +14,14 @@ type spnegoServer struct {
 	selectedMech Authenticator
 }
 
-func newSpnegoServer(mechs []Authenticator) *spnegoServer {
-	mechTypes := make([]asn1.ObjectIdentifier, len(mechs))
-	for i, mech := range mechs {
+// newSpnegoServer creates the SPNEGO state for one authentication exchange.
+// The given authenticators act as templates and are cloned, so concurrent
+// exchanges on different connections never share handshake state.
+func newSpnegoServer(templates []Authenticator) *spnegoServer {
+	mechs := make([]Authenticator, len(templates))
+	mechTypes := make([]asn1.ObjectIdentifier, len(templates))
+	for i, mech := range templates {
+		mechs[i] = mech.clone()
 		mechTypes[i] = mech.oid()
 	}
 	return &spnegoServer{
@@ -83,6 +88,9 @@ func (c *spnegoServer) challenge(negTokenReqBytes []byte) (negTokenChallengBytes
 
 func (c *spnegoServer) authenticate(negTokenRespBytes []byte) (negTokenAuthBytes []byte, user string, err error) {
 	if strings.HasPrefix(string(negTokenRespBytes), "NTLMSSP") {
+		if c.selectedMech == nil {
+			return nil, "", fmt.Errorf("authenticate without prior challenge")
+		}
 		if user, err = c.selectedMech.authenticate(negTokenRespBytes); err != nil {
 			return nil, "", err
 		}
@@ -99,6 +107,10 @@ func (c *spnegoServer) authenticate(negTokenRespBytes []byte) (negTokenAuthBytes
 			c.selectedMech = c.mechs[i]
 			break
 		}
+	}
+
+	if c.selectedMech == nil {
+		return nil, "", fmt.Errorf("authenticate without a selected mechanism")
 	}
 
 	if user, err = c.selectedMech.authenticate(negTokenResp.ResponseToken); err != nil {

@@ -108,7 +108,13 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	if name == "" {
 		name = "/"
 	} else {
-		name = strings.ReplaceAll(name, "\\", "/")
+		var ok bool
+		if name, ok = shareRelativePath(name); !ok {
+			log.Warnf("deny create with '..' path component user=%s path=%q", t.session.username, r.Name())
+			rsp := new(ErrorResponse)
+			PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_OBJECT_PATH_SYNTAX_BAD))
+			return c.sendPacket(rsp, &t.treeConn, ctx)
+		}
 	}
 
 	isEA := IsEA(name)
@@ -441,27 +447,10 @@ func (t *fileTree) handleQFid(pkt []byte, open *Open) (Encoder, error) {
 }
 
 func (t *fileTree) handleDH2Q(pkt []byte, open *Open) (Encoder, error) {
-	// Disable durable handles: we don't implement durable reconnect semantics.
+	// Durable handles are disabled: durable reconnect semantics are not
+	// implemented, so no DH2Q response context is returned. (The previous
+	// response-building code was unreachable after this return.)
 	return nil, nil
-
-	r := DurableHandleRequest2Decoder(pkt)
-	timeout := r.Timeout()
-	if timeout == 0 {
-		timeout = serverDurableHandleTimeout
-	}
-
-	open.isPersistent = (r.Flags() & SMB2_DHANDLE_FLAG_PERSISTENT) != 0
-	open.isDurable = open.isPersistent
-	open.durableOpenTimeout = time.Duration(timeout) * time.Millisecond
-	copy(open.createGuid[:], r.CreateGuid())
-
-	return &CreateContext{
-		Name: "DH2Q",
-		Data: &DurableHandleResponse2{
-			Timeout: timeout,
-			Flags:   r.Flags(),
-		},
-	}, nil
 }
 
 func (t *fileTree) handleRqLs(pkt []byte, open *Open) (Encoder, error) {
@@ -1100,16 +1089,25 @@ func (t *fileTree) handleDeleteReparsePointReq(ctx *compoundContext, pkt []byte)
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
-	err := t.fs.Unlink(vfs.VfsHandle(fileId.HandleId()))
+	// Only a symlink carries a reparse point here. Without this check the
+	// FSCTL would delete any regular file the handle points to.
+	attrs, err := t.fs.GetAttr(vfs.VfsHandle(fileId.HandleId()))
+	if err != nil || attrs.GetFileType() != vfs.FileTypeSymlink {
+		rsp := new(ErrorResponse)
+		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_NOT_A_REPARSE_POINT))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
+
+	err = t.fs.Unlink(vfs.VfsHandle(fileId.HandleId()))
 	if err != nil {
-		log.Errorf("handleDeleteReparsePointReq: Readlink() failed: %v", err)
+		log.Errorf("handleDeleteReparsePointReq: Unlink() failed: %v", err)
 		rsp := new(ErrorResponse)
 		PrepareResponse(rsp.Header(), pkt, uint32(STATUS_ACCESS_DENIED))
 		return c.sendPacket(rsp, &t.treeConn, ctx)
 	}
 
 	rsp := new(IoctlResponse)
-	rsp.CtlCode = FSCTL_GET_REPARSE_POINT
+	rsp.CtlCode = FSCTL_DELETE_REPARSE_POINT
 	rsp.FileId = fileId
 
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)
@@ -1150,6 +1148,34 @@ func (t *fileTree) handleCreateOrGetObjectId(ctx *compoundContext, pkt []byte) e
 	return c.sendPacket(rsp, &t.treeConn, ctx)
 }
 
+// reparseWriteAllowed decides whether FSCTL_SET/DELETE_REPARSE_POINT may
+// modify the file behind the request's handle. Both FSCTLs replace or remove
+// directory entries, so they are refused for read-only users and shares, and
+// (as in MS-FSA 2.1.5.10.36/37) the handle must have been opened with write
+// access. An invalid file id is let through so the handler can answer with
+// STATUS_INVALID_HANDLE.
+func (t *fileTree) reparseWriteAllowed(ctx *compoundContext, r IoctlRequestDecoder) bool {
+	if t.isUserReadOnly() || t.isShareReadOnly() {
+		return false
+	}
+	fileId := r.FileId().Decode()
+	if ctx != nil && ctx.fileId != nil {
+		fileId = ctx.fileId
+	}
+	if IsInvalidFileId(fileId) {
+		return true
+	}
+	if t.conn == nil || t.conn.serverCtx == nil {
+		return false
+	}
+	open := t.conn.serverCtx.getOpen(fileId.HandleId())
+	if open == nil {
+		return false
+	}
+	const writeAccess = FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED
+	return open.grantedAccess&writeAccess != 0
+}
+
 func (t *fileTree) ioctl(ctx *compoundContext, pkt []byte) error {
 	log.Tracef("Ioctl")
 
@@ -1179,12 +1205,19 @@ func (t *fileTree) ioctl(ctx *compoundContext, pkt []byte) error {
 	)
 
 	switch r.CtlCode() {
-	case FSCTL_SET_REPARSE_POINT:
-		return t.handleReparsePointReq(ctx, pkt)
+	case FSCTL_SET_REPARSE_POINT, FSCTL_DELETE_REPARSE_POINT:
+		if !t.reparseWriteAllowed(ctx, r) {
+			log.Warnf("deny reparse point change user=%s code=0x%x", t.session.username, r.CtlCode())
+			rsp := new(ErrorResponse)
+			PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_ACCESS_DENIED))
+			return c.sendPacket(rsp, &t.treeConn, ctx)
+		}
+		if r.CtlCode() == FSCTL_SET_REPARSE_POINT {
+			return t.handleReparsePointReq(ctx, pkt)
+		}
+		return t.handleDeleteReparsePointReq(ctx, pkt)
 	case FSCTL_GET_REPARSE_POINT:
 		return t.handleGetReparsePointReq(ctx, pkt)
-	case FSCTL_DELETE_REPARSE_POINT:
-		return t.handleDeleteReparsePointReq(ctx, pkt)
 	case FSCTL_CREATE_OR_GET_OBJECT_ID:
 		return t.handleCreateOrGetObjectId(ctx, pkt)
 	}
@@ -1643,6 +1676,7 @@ func (t *fileTree) changeNotify(ctx *compoundContext, pkt []byte) error {
 	/*ch := make(chan *vfs.NotifyEvent)
 	t.fs.RegisterNotify(vfs.VfsHandle(fileId.HandleId()), ch)
 	go func(ctx *compoundContext, ch chan *vfs.NotifyEvent, isDir bool, pkt []byte) {
+		defer c.recoverConn("change notify")
 		ev := <-ch
 		if ev != nil {
 			log.Errorf("notification received: %v, %v", isDir, ev)
@@ -1697,6 +1731,7 @@ func (t *fileTree) changeNotify(ctx *compoundContext, pkt []byte) error {
 	copy(savedPkt, pkt)
 
 	go func(ctx *compoundContext, reqPkt []byte, h uint64) {
+		defer c.recoverConn("change notify")
 		var events []notifyEvent
 		// Wait indefinitely for real events or cancel — like real Samba.
 		// Never send STATUS_CANCELLED on timeout (Explorer gives up after
@@ -2357,7 +2392,13 @@ func (t *fileTree) setRename(ctx *compoundContext, fileId *FileId, pkt []byte) e
 	info := FileRenameInformationInfoDecoder(r.Buffer())
 
 	log.Tracef("setRename %s, root %d", info.FileName(), info.RootDirectory())
-	to := strings.ReplaceAll(info.FileName(), "\\", "/")
+	to, ok := shareRelativePath(info.FileName())
+	if !ok {
+		log.Warnf("deny rename to '..' path user=%s target=%q", t.session.username, info.FileName())
+		rsp := new(ErrorResponse)
+		PrepareResponse(&rsp.PacketHeader, pkt, uint32(STATUS_OBJECT_PATH_SYNTAX_BAD))
+		return c.sendPacket(rsp, &t.treeConn, ctx)
+	}
 	open := t.conn.serverCtx.getOpen(fileId.HandleId())
 	if err := t.fs.Rename(vfs.VfsHandle(fileId.HandleId()), to, int(info.ReplaceIfExists())); err != nil {
 		log.Errorf("rename failed: %v", err)
