@@ -2525,55 +2525,16 @@ func (t *fileTree) setSecInfo(ctx *compoundContext, fileId *FileId, pkt []byte) 
 			aceBuf = aceBuf[ace.Size():]
 		}
 		if !foundNfsMode {
-			log.Tracef("setSecInfo: no NFS mode SID, deriving mode from ACE masks")
-			// Derive Unix mode from standard Windows ACE access masks
-			ownerMode := uint32(0)
-			groupMode := uint32(0)
-			otherMode := uint32(0)
-			derivedMode := false
-			aceBuf2 := dacl.Aces()
-			for i := 0; i < int(dacl.AceCount()); i++ {
-				ace2 := AceDecoder(aceBuf2)
-				if ace2.Type() == ACCESS_ALLOWED_ACE_TYPE {
-					sid2 := SidDecoder(ace2.Sid())
-					subs2 := sid2.SubAuthority()
-					mask := ace2.Mask()
-					bits := uint32(0)
-					if mask&0x01 != 0 {
-						bits |= 4
-					} // FILE_READ_DATA → read
-					if mask&0x02 != 0 {
-						bits |= 2
-					} // FILE_WRITE_DATA → write
-					if mask&0x20 != 0 {
-						bits |= 1
-					} // FILE_EXECUTE → execute
-					auth := sid2.IdentifierAuthority()
-					cnt := sid2.SubAuthorityCount()
-					if auth == 5 && cnt == 3 && subs2[0] == 88 && subs2[1] == 1 {
-						ownerMode = bits
-						derivedMode = true
-					} else if auth == 22 && cnt == 2 && subs2[0] == 1 {
-						ownerMode = bits
-						derivedMode = true
-					} else if auth == 5 && cnt == 3 && subs2[0] == 88 && subs2[1] == 2 {
-						groupMode = bits
-						derivedMode = true
-					} else if auth == 22 && cnt == 2 && subs2[0] == 2 {
-						groupMode = bits
-						derivedMode = true
-					} else if auth == 1 && cnt == 1 && subs2[0] == 0 {
-						otherMode = bits
-						derivedMode = true
-					}
-				}
-				aceBuf2 = aceBuf2[ace2.Size():]
+			current := uint32(0)
+			if cur, err := t.fs.GetAttr(vfs.VfsHandle(fileId.HandleId())); err == nil {
+				current, _ = cur.GetUnixMode()
 			}
-			if derivedMode {
-				mode := (ownerMode << 6) | (groupMode << 3) | otherMode
-				log.Tracef("setSecInfo: derived mode=0%o (owner=%d group=%d other=%d)", mode, ownerMode, groupMode, otherMode)
+			if mode, ok := modeFromDacl(dacl, current); ok {
+				log.Tracef("setSecInfo: derived mode=0%o from DACL (was 0%o)", mode, current&0o777)
 				a.SetUnixMode(mode)
 				changed = true
+			} else {
+				log.Tracef("setSecInfo: DACL names no Unix owner/group, mode unchanged")
 			}
 		}
 	} else {

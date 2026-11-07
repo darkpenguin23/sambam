@@ -253,3 +253,73 @@ func TestStreamResizeIsBounded(t *testing.T) {
 		}
 	}
 }
+
+func (e *handleEnv) setDacl(name string, aces ...ACE) {
+	e.t.Helper()
+	ctx := newChain()
+	e.ft.create(ctx, e.createPkt(name, READ_CONTROL|WRITE_DAC|FILE_READ_ATTRIBUTES, 0))
+	if ctx.fileId == nil {
+		e.t.Fatalf("CREATE %s failed: %v", name, statusOf(ctx.rsp[0]))
+	}
+	acl := ACL(aces)
+	pkt := e.encode(&SetInfoRequest{
+		InfoType:              SMB2_0_INFO_SECURITY,
+		AdditionalInformation: DACL_SECUIRTY_INFORMATION,
+		FileId:                &relatedFileId,
+		Input:                 &SecurityDescriptor{Dacl: &acl},
+	}, true)
+	e.ft.setInfo(ctx, pkt)
+	if st := statusOf(ctx.rsp[len(ctx.rsp)-1]); st != 0 {
+		e.t.Fatalf("SET_INFO(security) on %s: %v", name, st)
+	}
+	e.ft.close(ctx, e.encode(&CloseRequest{FileId: &relatedFileId}, true))
+}
+
+func (e *handleEnv) mode(name string) os.FileMode {
+	e.t.Helper()
+	fi, err := os.Stat(filepath.Join(e.share, name))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return fi.Mode().Perm()
+}
+
+func TestSetSecurityDescriptorMode(t *testing.T) {
+	everyone := &SID{IdentifierAuthority: WORLD_SID_AUTHORITY, SubAuthority: []uint32{0}}
+	unixUser := &SID{IdentifierAuthority: SID_IDENTIFIER_AUTHORITY{0, 0, 0, 0, 0, 22}, SubAuthority: []uint32{1, 1000}}
+	unixGroup := &SID{IdentifierAuthority: SID_IDENTIFIER_AUTHORITY{0, 0, 0, 0, 0, 22}, SubAuthority: []uint32{2, 1000}}
+	nfsMode := func(m uint32) *SID {
+		return &SID{IdentifierAuthority: SECURITY_NT_AUTHORITY, SubAuthority: []uint32{88, 3, m}}
+	}
+	allow := func(sid *SID, mask uint32) ACE { return ACE{Sid: sid, Type: ACCESS_ALLOWED_ACE_TYPE, Mask: mask} }
+
+	cases := []struct {
+		name string
+		aces []ACE
+		want os.FileMode
+	}{
+		// What queryInfoSec reports: writing it back must not change anything
+		// (it used to set the mode to 000).
+		{"server's own DACL", []ACE{allow(everyone, GENERIC_ALL)}, 0o644},
+		// A Windows DACL does not describe Unix permissions (it used to give 005).
+		{"windows DACL", []ACE{allow(everyone, 0x1200a9)}, 0o644},
+		// Linux cifs with cifsacl/idsfromsid: owner rwx, group r-x, other r--.
+		{"posix DACL", []ACE{allow(unixUser, 0x1f01ff), allow(unixGroup, 0x1200a9), allow(everyone, 0x120089)}, 0o754},
+		// Generic rights count; "other" is not mentioned and keeps its bits.
+		{"generic rights", []ACE{allow(unixUser, GENERIC_ALL), allow(unixGroup, GENERIC_READ)}, 0o744},
+		{"nfs mode sid", []ACE{allow(nfsMode(0o640), 0)}, 0o640},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := newHandleEnv(t)
+			e.touch("f.txt")
+			if err := os.Chmod(filepath.Join(e.share, "f.txt"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			e.setDacl("f.txt", c.aces...)
+			if got := e.mode("f.txt"); got != c.want {
+				t.Errorf("mode = %#o, want %#o", got, c.want)
+			}
+		})
+	}
+}
