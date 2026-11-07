@@ -186,6 +186,7 @@ readonly = true
 
 [share.media]
 path = "/mnt/media"
+allow_users = ["alice", "bob"]
 
 [share.private]
 path = "/home/user/private"

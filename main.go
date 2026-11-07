@@ -757,6 +757,67 @@ func (f *logFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 }
 
 // generatePassword creates a random alphanumeric password
+// generatedCredentialsEnv names a file through which a daemon's parent
+// process hands the passwords it generated (and printed) to the daemon
+// child. go-daemon re-runs main() in the child, which used to generate new
+// random passwords, so the printed credentials never worked in daemon mode.
+// The passwords travel in a 0600 file that the child reads and deletes;
+// only its path is put into the environment (a process's initial
+// environment stays readable in /proc/<pid>/environ).
+const generatedCredentialsEnv = "SAMBAM_GENERATED_CREDENTIALS_FILE"
+
+// daemonChildEnv returns the environment for the daemon child: nil (inherit
+// as is) unless passwords were generated.
+func daemonChildEnv(generatedCreds []string) []string {
+	// The child runs main() again and reaches this point too; only the
+	// parent hands credentials over.
+	if len(generatedCreds) == 0 || daemon.WasReborn() {
+		return nil
+	}
+	f, err := os.CreateTemp("", "sambam-creds-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to pass generated credentials to daemon: %v\n", err)
+		os.Exit(1)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(strings.Join(generatedCreds, "\n")); err != nil {
+		os.Remove(f.Name())
+		fmt.Fprintf(os.Stderr, "Unable to pass generated credentials to daemon: %v\n", err)
+		os.Exit(1)
+	}
+	return append(os.Environ(), generatedCredentialsEnv+"="+f.Name())
+}
+
+// inheritedPasswords returns the generated passwords passed down by the
+// daemon parent ("user:password" lines), keyed by lower-case user name. The
+// file is only honoured in a daemon child and deleted after reading.
+var inheritedPasswords = sync.OnceValue(func() map[string]string {
+	passwords := map[string]string{}
+	path, ok := os.LookupEnv(generatedCredentialsEnv)
+	if !ok || !daemon.WasReborn() {
+		return passwords
+	}
+	os.Unsetenv(generatedCredentialsEnv)
+	data, err := os.ReadFile(path)
+	os.Remove(path)
+	if err != nil {
+		return passwords
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if name, pass, ok := strings.Cut(line, ":"); ok && name != "" && pass != "" {
+			passwords[strings.ToLower(name)] = pass
+		}
+	}
+	return passwords
+})
+
+func passwordForGeneratedUser(name string) string {
+	if p, ok := inheritedPasswords()[strings.ToLower(name)]; ok {
+		return p
+	}
+	return generatePassword(10)
+}
+
 func generatePassword(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	result := make([]byte, length)
@@ -1002,9 +1063,15 @@ func main() {
 		markCLI("logfile")
 	}
 
-	// Validate listen values (IP[:port] or @iface[:port]) before doing anything else.
-	for _, listenAddr := range *listenAddrs {
+	// Validate listen values (IP[:port], :port or @iface[:port]) before doing anything else.
+	for i, listenAddr := range *listenAddrs {
 		host, port := parseHostPort(listenAddr)
+		if host == "" && port != "" {
+			// ":8888" listens on all interfaces, like the default 0.0.0.0:445
+			// (and as the README shows).
+			host = "0.0.0.0"
+			(*listenAddrs)[i] = net.JoinHostPort(host, port)
+		}
 		if strings.HasPrefix(host, "@") {
 			ifaceName := strings.TrimPrefix(host, "@")
 			if ifaceName == "" {
@@ -1021,6 +1088,16 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Invalid listen port in %q: expected 1-65535\n", listenAddr)
 				os.Exit(1)
 			}
+		}
+	}
+
+	// Validate the expiry before anything starts. It used to be parsed only
+	// once the server was running - with -d after the parent had already
+	// reported a successful start - and "-e 0" shut down immediately.
+	if *expireStr != "" {
+		if d, err := time.ParseDuration(*expireStr); err != nil || d <= 0 {
+			fmt.Fprintf(os.Stderr, "Invalid expire duration %q: use a positive duration such as 30m, 2h or 24h\n", *expireStr)
+			os.Exit(1)
 		}
 	}
 
@@ -1335,6 +1412,7 @@ func main() {
 		cwd, _ := os.Getwd()
 
 		ctx := &daemon.Context{
+			Env:         daemonChildEnv(generatedCreds),
 			PidFileName: *pidFile,
 			PidFilePerm: 0644,
 			LogFileName: logFileName,
@@ -1345,6 +1423,11 @@ func main() {
 
 		child, err := ctx.Reborn()
 		if err != nil {
+			for _, kv := range ctx.Env {
+				if path, ok := strings.CutPrefix(kv, generatedCredentialsEnv+"="); ok {
+					os.Remove(path)
+				}
+			}
 			fmt.Fprintf(os.Stderr, "Unable to start daemon: %v\n", err)
 			os.Exit(1)
 		}
@@ -2892,7 +2975,7 @@ func buildAuthUsers(cliUsers []string, cliPassword string, cliUsersChanged bool,
 		}
 		for i, u := range users {
 			if u.Password == "" {
-				users[i].Password = generatePassword(10)
+				users[i].Password = passwordForGeneratedUser(u.Name)
 			}
 		}
 		return normalize(users), nil
