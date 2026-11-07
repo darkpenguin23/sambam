@@ -505,11 +505,8 @@ func (conn *conn) runReciever() {
 				compCtx = &compoundContext{
 					treeId:    uint64(p.TreeId()),
 					sessionId: p.SessionId(),
+					lastMsgId: compoundLastMsgId(pkt),
 				}
-			}
-
-			if p.IsCompoundLast() {
-				compCtx.lastMsgId = p.MessageId()
 			}
 
 			if off := p.NextCommand(); off != 0 {
@@ -854,6 +851,9 @@ func (conn *conn) sendPacket(req Packet, tc *treeConn, compCtx *compoundContext)
 
 	if compCtx != nil {
 		compCtx.lastStatus = req.Header().Status
+		if req.Header().Command == SMB2_CREATE && req.Header().Status>>30 == 3 {
+			compCtx.createStatus = req.Header().Status
+		}
 
 		compCtx.addResponse(pkt)
 		if req.Header().MessageId != compCtx.lastMsgId {

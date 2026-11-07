@@ -95,8 +95,9 @@ type notifyEvent struct {
 
 type Open struct {
 	ioMu                        sync.Mutex
-	enumStarted                 bool // QUERY_DIRECTORY: a query already ran in the current scan
-	enumSingleDone              bool // QUERY_DIRECTORY: entry for a non-wildcard name already returned
+	fs                          vfs.VFSFileSystem // filesystem of the share the handle belongs to
+	enumStarted                 bool              // QUERY_DIRECTORY: a query already ran in the current scan
+	enumSingleDone              bool              // QUERY_DIRECTORY: entry for a non-wildcard name already returned
 	fileId                      uint64
 	durableFileId               uint64
 	session                     *session
@@ -404,7 +405,14 @@ func (d *Server) serveListener(listener net.Listener) {
 		go conn.runSender()
 
 		run := func() {
-			if err := conn.runGuarded(); err != nil {
+			err := conn.runGuarded()
+			// The client is gone; durable handles are not supported, so every
+			// handle it still holds must be released now.
+			conn.releaseOpens("disconnect", func(*Open) bool { return true })
+			d.lock.Lock()
+			delete(d.activeConns, conn)
+			d.lock.Unlock()
+			if err != nil {
 				if !isNormalDisconnect(err) {
 					conn.errorf("err: %v", err)
 				}
@@ -497,10 +505,12 @@ func (c *conn) Run() error {
 				continue
 			}
 
-			// if prev transaction req failed, don't forward it
-			if compCtx != nil && compCtx.lastStatus != 0 {
+			// A related request after a failed CREATE has no valid handle:
+			// answer it with the CREATE's error. Other failures in the chain
+			// do not stop the remaining requests (notably the CLOSE).
+			if status, failed := compCtx.relatedCreateFailure(p); failed {
 				rsp := new(ErrorResponse)
-				PrepareResponse(&rsp.PacketHeader, pkt, uint32(compCtx.lastStatus))
+				PrepareResponse(&rsp.PacketHeader, pkt, status)
 				c.sendPacket(rsp, tc.getTree(), compCtx)
 				continue
 			}
@@ -631,6 +641,8 @@ func (c *conn) logoff(pkt []byte) error {
 	c.debugf("logoff")
 
 	p := PacketCodec(pkt)
+	sid := p.SessionId()
+	c.releaseOpens("logoff", func(o *Open) bool { return o.session.sessionId == sid })
 	rsp := new(LogoffResponse)
 
 	rsp.CreditRequestResponse = p.CreditRequest()
@@ -779,6 +791,10 @@ func (c *conn) treeDisconnect(pkt []byte) error {
 	var tree *treeConn = nil
 	if tc != nil {
 		tree = tc.getTree()
+		sid := p.SessionId()
+		c.releaseOpens("tree disconnect", func(o *Open) bool {
+			return o.tree == tree && o.session.sessionId == sid
+		})
 		tree.refCount--
 		if tree.refCount == 0 {
 			if tree.path != "\\IPC$" {

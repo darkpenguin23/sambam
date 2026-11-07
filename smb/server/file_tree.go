@@ -313,6 +313,7 @@ func (t *fileTree) create(ctx *compoundContext, pkt []byte) error {
 	}
 
 	open := &Open{
+		fs:                t.fs,
 		fileId:            rsp.FileId.HandleId(),
 		durableFileId:     rsp.FileId.NodeId(),
 		session:           t.session,
@@ -594,12 +595,8 @@ func (t *fileTree) close(ctx *compoundContext, pkt []byte) error {
 	}
 
 	fileId := r.FileId().Decode()
-	status := uint32(0)
 	if ctx != nil && ctx.fileId != nil {
 		fileId = ctx.fileId
-		if ctx.lastStatus != 0 {
-			status = ctx.lastStatus
-		}
 	}
 
 	if IsInvalidFileId(fileId) {
@@ -611,8 +608,6 @@ func (t *fileTree) close(ctx *compoundContext, pkt []byte) error {
 
 	rsp := new(CloseResponse)
 	PrepareResponse(&rsp.PacketHeader, pkt, 0)
-
-	rsp.Status = status
 
 	open := t.conn.serverCtx.getOpen(fileId.HandleId())
 	if r.Flags()&SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB != 0 {
@@ -636,32 +631,14 @@ func (t *fileTree) close(ctx *compoundContext, pkt []byte) error {
 		rsp.FileAttributes = PermissionsFromVfs(a, open.pathName, t.conn.serverCtx.hideDotfiles)
 	}
 send:
-	if open != nil && open.deleteAfterClose {
-		if err := t.fs.Unlink(vfs.VfsHandle(fileId.HandleId())); err != nil {
-			log.Errorf("Delete failed: %v", err)
-			if rsp.Status == 0 {
-				rsp.Status = uint32(STATUS_ACCESS_DENIED)
-			}
-		} else if open.pathName != "" {
-			c.infof("delete: %s", open.pathName)
-			t.conn.serverCtx.notifyChange(open.pathName, FILE_ACTION_REMOVED)
-		}
+	if err := t.conn.serverCtx.releaseOpen(fileId.HandleId(), open, t.fs); err != nil {
+		log.Errorf("Delete failed: %v", err)
+		rsp.Status = uint32(STATUS_ACCESS_DENIED)
+	} else if open != nil && open.deleteAfterClose && open.pathName != "" {
+		c.infof("delete: %s", open.pathName)
 	}
-
-	t.conn.serverCtx.deleteOpen(fileId.HandleId())
-	t.fs.Close(vfs.VfsHandle(fileId.HandleId()))
 
 	c.sendPacket(rsp, &t.treeConn, ctx)
-
-	if open != nil && open.notifyCancel != nil {
-		select {
-		case open.notifyCancel <- struct{}{}:
-		default:
-		}
-	}
-	if open != nil && open.fsWatchPath != "" {
-		t.conn.serverCtx.removeFsWatch(open.fsWatchPath)
-	}
 	return nil
 }
 
@@ -1533,9 +1510,6 @@ func (t *fileTree) queryDirectory(ctx *compoundContext, pkt []byte) error {
 
 	out := &FileInformationInfoResponse{}
 	Status := uint32(0)
-	if ctx != nil && ctx.lastStatus != 0 {
-		Status = ctx.lastStatus
-	}
 
 	// RESTART_SCANS and REOPEN both start a new scan of the directory.
 	restart := r.Flags()&(RESTART_SCANS|REOPEN) != 0
