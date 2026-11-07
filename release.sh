@@ -97,6 +97,9 @@ success "Standalone binaries ready"
 
 # Step 3: Upload packages and binaries to GitLab
 if $DO_GITLAB; then
+  # Puppet (base::sambam) installs the .deb from this registry: a release
+  # without it breaks every node, so missing settings are fatal.
+  [ -n "$GITLAB_API" ] && [ -n "$GITLAB_TOKEN" ] || error "GITLAB_API/GITLAB_TOKEN not set (.release-config)"
   progress "Uploading artifacts to GitLab..."
 
   UPLOAD_COUNT=0
@@ -106,10 +109,11 @@ if $DO_GITLAB; then
     for PKG in dist/sambam_${VERSION}_linux_*; do
       if [ -f "$PKG" ]; then
         FILENAME=$(basename "$PKG")
-        curl -s --request PUT \
+        curl -sSf --request PUT \
              --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
              --upload-file "$PKG" \
-             "$GITLAB_API/packages/generic/sambam/$VERSION/$FILENAME" > /dev/null
+             "$GITLAB_API/packages/generic/sambam/$VERSION/$FILENAME" > /dev/null \
+          || error "upload of $FILENAME to GitLab failed"
         UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
         echo "  ✓ $FILENAME"
       fi
@@ -119,10 +123,11 @@ if $DO_GITLAB; then
   # Upload binaries
   for BINARY in sambam-linux-amd64 sambam-linux-arm64 sambam-linux-armv6 sambam-darwin-arm64 sambam-windows-amd64.exe; do
     if [ -f "$BINARY" ]; then
-      curl -s --request PUT \
+      curl -sSf --request PUT \
            --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
            --upload-file "$BINARY" \
-           "$GITLAB_API/packages/generic/sambam/$VERSION/$BINARY" > /dev/null
+           "$GITLAB_API/packages/generic/sambam/$VERSION/$BINARY" > /dev/null \
+        || error "upload of $BINARY to GitLab failed"
       UPLOAD_COUNT=$((UPLOAD_COUNT + 1))
       echo "  ✓ $BINARY"
     fi
@@ -184,17 +189,19 @@ data = {
 print(json.dumps(data, indent=2))
 " > "$TEMP_JSON"
 
-  # Create or update release
-  curl -s --request POST \
+  # Create or update release (curl -f: an HTTP error must not count as
+  # success, otherwise the fallback never runs and failures go unnoticed)
+  curl -sf --request POST \
        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        --header "Content-Type: application/json" \
        --data @"$TEMP_JSON" \
        "$GITLAB_API/releases" > /dev/null || \
-  curl -s --request PUT \
+  curl -sSf --request PUT \
        --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
        --header "Content-Type: application/json" \
        --data @"$TEMP_JSON" \
-       "$GITLAB_API/releases/$TAG" > /dev/null
+       "$GITLAB_API/releases/$TAG" > /dev/null \
+    || error "creating the GitLab release $TAG failed"
 
   success "GitLab release created"
 fi
